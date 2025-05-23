@@ -1,36 +1,5 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "server.js",
-      "use": "@vercel/node",
-      "config": {
-        "maxLambdaSize": "50mb"
-      }
-    }
-  ],
-  "routes": [
-    {
-      "src": "/health",
-      "dest": "/server.js"
-    },
-    {
-      "src": "/api/(.*)",
-      "dest": "/server.js"
-    },
-    {
-      "src": "/debug/(.*)",
-      "dest": "/server.js"
-    },
-    {
-      "src": "/admin/(.*)",
-      "dest": "/server.js"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/server.js"
-    }
-  ],
   "functions": {
     "server.js": {
       "maxDuration": 30,
@@ -38,6 +7,28 @@
       "runtime": "nodejs18.x"
     }
   },
+  "rewrites": [
+    {
+      "source": "/health",
+      "destination": "/api/server"
+    },
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/server"
+    },
+    {
+      "source": "/debug/(.*)",
+      "destination": "/api/server"
+    },
+    {
+      "source": "/admin/(.*)",
+      "destination": "/api/server"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/api/server"
+    }
+  ],
   "env": {
     "NODE_ENV": "production"
   },
