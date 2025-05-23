@@ -3103,5 +3103,54 @@ if (process.env.NODE_ENV === 'development') {
   }, 60000); // Check every minute
 }
 
+// ⭐ สำคัญที่สุด: Start Server ต้องอยู่ที่ท้ายสุด
+async function startServer() {
+  try {
+    // เชื่อมต่อฐานข้อมูล (ไม่บังคับ)
+    await initDatabase();
+    
+    // ⭐ สำคัญ: ต้อง listen เสมอ
+    const server = app.listen(port, '0.0.0.0', () => {
+      console.log('\n🎉 ========================================');
+      console.log('🚀 Mobile Time Tracker Server is running!');
+      console.log('🎉 ========================================');
+      console.log(`🌐 Server URL: http://0.0.0.0:${port}`);
+      console.log(`💊 Health Check: http://0.0.0.0:${port}/health`);
+      console.log(`📱 Mobile API: http://0.0.0.0:${port}/api/mobile`);
+      console.log('🎉 ========================================\n');
+      console.log('✅ Server started successfully!');
+    });
+    
+    // Handle server errors
+    server.on('error', (error) => {
+      console.error('❌ Server error:', error);
+      if (error.code === 'EADDRINUSE') {
+        console.error(`❌ Port ${port} is already in use`);
+        process.exit(1);
+      }
+      throw error;
+    });
+    
+    // Graceful shutdown
+    process.on('SIGTERM', () => {
+      console.log('📱 SIGTERM received, shutting down gracefully...');
+      server.close(() => {
+        console.log('📱 Server closed');
+        process.exit(0);
+      });
+    });
+    
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    // ไม่ exit ให้ลอง listen แล้วกัน
+    const server = app.listen(port, '0.0.0.0', () => {
+      console.log(`🚀 Server running on port ${port} (limited functionality)`);
+    });
+  }
+}
+
+// ⭐ Start the server
+startServer();
+
 console.log('📝 Server script loaded successfully');
-console.log('⏳ Waiting for initialization to complete...');
+console.log('⏳ Starting server...');
