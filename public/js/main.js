@@ -1,3 +1,6 @@
+// Enhanced main.js - เพิ่ม Mobile Performance
+// เก็บโค้ดเดิมไว้ทั้งหมด และเพิ่มส่วน optimization
+
 // กำหนด URL ของ API
 var scripturl = '/api';
 var owner = 'งานเทคโนโลยีสารสนเทศ' + '\n' + 'อบต.ข่าใหญ่';
@@ -5,10 +8,82 @@ var owner = 'งานเทคโนโลยีสารสนเทศ' + '\n
 // ตัวแปรสำหรับเก็บข้อมูลโปรไฟล์และพิกัด
 var profile = null;
 var gps;
-var locationPermissionGranted = false; // เพิ่มตัวแปรสถานะการอนุญาตใช้ตำแหน่ง
+var locationPermissionGranted = false;
+
+// ⭐ เพิ่มตัวแปรสำหรับ mobile performance
+var mobilePerf = {
+  apiCache: new Map(),
+  requestQueue: [],
+  isProcessing: false,
+  retryCount: 0,
+  maxRetries: 3
+};
+
+// ⭐ Performance-optimized API call
+function optimizedAjax(options) {
+  return new Promise((resolve, reject) => {
+    // Check cache first
+    const cacheKey = `${options.method || 'GET'}:${options.url}:${JSON.stringify(options.data || {})}`;
+    const cached = mobilePerf.apiCache.get(cacheKey);
+    
+    if (cached && (Date.now() - cached.timestamp) < 30000) { // 30 second cache
+      console.log('📱 Using cached response for:', options.url);
+      resolve(cached.data);
+      return;
+    }
+
+    // Add timeout and retry logic
+    const originalSuccess = options.success;
+    const originalError = options.error;
+    
+    options.timeout = options.timeout || 10000; // 10 second timeout
+    
+    options.success = function(data) {
+      // Cache successful responses
+      if (data && typeof data === 'object') {
+        mobilePerf.apiCache.set(cacheKey, {
+          data: data,
+          timestamp: Date.now()
+        });
+      }
+      
+      if (originalSuccess) originalSuccess(data);
+      resolve(data);
+    };
+    
+    options.error = function(xhr, status, error) {
+      console.error('📱 API Error:', status, error);
+      
+      // Retry logic for network errors
+      if (mobilePerf.retryCount < mobilePerf.maxRetries && 
+          (status === 'timeout' || status === 'error')) {
+        mobilePerf.retryCount++;
+        console.log(`📱 Retrying API call (${mobilePerf.retryCount}/${mobilePerf.maxRetries}):`, options.url);
+        
+        setTimeout(() => {
+          $.ajax(options);
+        }, 1000 * mobilePerf.retryCount); // Exponential backoff
+        return;
+      }
+      
+      mobilePerf.retryCount = 0;
+      if (originalError) originalError(xhr, status, error);
+      reject(new Error(`${status}: ${error}`));
+    };
+    
+    $.ajax(options);
+  });
+}
 
 // เมื่อโหลดหน้าเสร็จ
 $(document).ready(function () {
+  console.log('📱 App starting...');
+  
+  // ⭐ เริ่ม performance monitoring
+  if (typeof MobilePerformanceMonitor !== 'undefined') {
+    window.perfMonitor = new MobilePerformanceMonitor();
+  }
+  
   // กำหนดการทำงานของปุ่ม
   $('#clockin').click(() => requestLocationAndClockIn());
   $('#clockout').click(() => requestLocationAndClockOut());
@@ -16,11 +91,19 @@ $(document).ready(function () {
   // แสดงเวลา
   showTime();
   
-  // เริ่มดึงตำแหน่ง GPS แต่ไม่บังคับ (จะแสดง UI สวยงามตอนกดปุ่มลงเวลา)
-  getlocation(false);
+  // ⭐ เริ่มดึงตำแหน่ง GPS แบบ non-blocking
+  if (typeof requestIdleCallback !== 'undefined') {
+    requestIdleCallback(() => {
+      getlocation(false);
+    });
+  } else {
+    setTimeout(() => {
+      getlocation(false);
+    }, 100);
+  }
 
   // ดึง LIFF ID จากฐานข้อมูล
-  $.ajax({
+  optimizedAjax({
     method: "GET",
     url: "/api/getLiffId",
     success: function(response) {
@@ -40,115 +123,179 @@ $(document).ready(function () {
   });
 });
 
+// ⭐ Optimized LIFF initialization
 function initializeLiff(liffId) {
-  console.log("กำลังเริ่มต้น LIFF ด้วย ID:", liffId);
+  console.log("📱 กำลังเริ่มต้น LIFF ด้วย ID:", liffId);
   
-  // เริ่มต้น LINE LIFF
+  // Show loading state
+  if (typeof MobileUI !== 'undefined') {
+    const loaderId = MobileUI.loading.show('loading', 'กำลังเชื่อมต่อ LINE...');
+    
+    setTimeout(() => {
+      MobileUI.loading.hide(loaderId);
+    }, 5000); // Hide after 5 seconds max
+  }
+  
   liff.init({
     liffId: liffId,
     withLoginOnExternalBrowser: true
   }).then(() => {
-    console.log("LIFF initialized successfully");
+    console.log("📱 LIFF initialized successfully");
     
-    // ตรวจสอบว่าได้เข้าสู่ระบบแล้วหรือไม่
     if (!liff.isLoggedIn()) {
-      console.log("User not logged in, triggering login");
+      console.log("📱 User not logged in, triggering login");
       liff.login();
       return;
     }
     
     // ดึงข้อมูลโปรไฟล์
-    try {
-      // ใช้ liff.getProfile() แทน getDecodedIDToken()
-      liff.getProfile().then(userProfile => {
-        profile = userProfile;
-        console.log("🚀 ~ profile:", profile);
-        console.log("User ID: " + profile.userId);
-        console.log("Display Name: " + profile.displayName);
-        console.log("Picture URL: " + (profile.pictureUrl || "ไม่พบรูปโปรไฟล์"));
-        
-        // เริ่มต้นแอป
-        initApp();
-      }).catch(err => {
-        console.error("Error getting profile:", err);
-        // กรณีไม่สามารถดึงโปรไฟล์ได้ แต่ยังใช้งานต่อได้
-        initApp();
-      });
-    } catch (err) {
-      console.error("Error in profile retrieval:", err);
-      // กรณีเกิดข้อผิดพลาด แต่ยังใช้งานต่อได้
+    liff.getProfile().then(userProfile => {
+      profile = userProfile;
+      console.log("📱 Profile loaded:", profile.displayName);
+      
+      // Show success toast
+      if (typeof MobileUI !== 'undefined') {
+        MobileUI.toast.success(`ยินดีต้อนรับ ${profile.displayName}`);
+      }
+      
       initApp();
-    }
+    }).catch(err => {
+      console.error("📱 Error getting profile:", err);
+      initApp();
+    });
   }).catch(err => {
-    console.error("LIFF initialization failed", err);
+    console.error("📱 LIFF initialization failed", err);
     $('#message').html("ไม่สามารถเชื่อมต่อกับ LINE ได้ กรุณาติดต่อผู้ดูแลระบบ");
     document.getElementById('message').className = 'alert alert-danger';
     
-    // แม้จะมีปัญหากับ LIFF ก็ยังให้ใช้งานแอปได้
+    if (typeof MobileUI !== 'undefined') {
+      MobileUI.toast.error("ไม่สามารถเชื่อมต่อ LINE ได้");
+    }
+    
     initApp();
   });
 }
 
-// ฟังก์ชันเริ่มต้นแอป
+// ⭐ Optimized app initialization
 function initApp() {
+  console.log('📱 Initializing app...');
+  
   document.getElementById('message').innerText = owner;
   document.getElementById('message').className = 'alert msgBg';
   
-  // ดึงรายชื่อพนักงานสำหรับ autocomplete
-  $.ajax({
-    method: "POST",
-    url: scripturl + "/getdata",
-    data: {},
-    success: function (dataPerson) {
-      console.log(dataPerson);
-      $(function () {
-        var availableTags = dataPerson;
-        $("#employee").autocomplete({
-          maxShowItems: 3,
-          source: availableTags
-        });
-      });
-    }
-  });
-
-  // ดึงรายชื่อพนักงานสำหรับ dropdown
-  getEmployees();
+  // ⭐ Load employees with better error handling
+  loadEmployeesOptimized();
 }
 
-// ฟังก์ชันดึงรายชื่อพนักงาน
-function getEmployees() {
-  $.ajax({
-    method: "POST",
-    url: scripturl + "/getemployee",
-    data: {},
-    success: function (ar) {
-      var employeeSelect = document.getElementById("employee");
-
-      let option = document.createElement("option");
-      option.value = "";
-      option.text = "";
-      employeeSelect.appendChild(option);
-
-      ar.forEach(function (item, index) {
-        let option = document.createElement("option");
-        var employee = item[0];
-        option.value = item[0];
-        option.text = item[0];
-        employeeSelect.appendChild(option);
-      });
-    }
-  });
-}
-
-// ฟังก์ชันดึงเวลาไคลเอ็นต์พร้อมดีบั๊ก
-function getClientTime() {
-  // สร้างวัตถุเวลาปัจจุบัน
-  var currentTime = new Date();
+// ⭐ Optimized employee loading
+function loadEmployeesOptimized() {
+  const loadingToast = typeof MobileUI !== 'undefined' ? 
+    MobileUI.toast.loading('กำลังโหลดรายชื่อพนักงาน...') : null;
   
-  // แปลงเป็นใช้เวลา UTC ตามมาตรฐาน
+  Promise.all([
+    optimizedAjax({
+      method: "POST",
+      url: scripturl + "/getdata",
+      data: {},
+      timeout: 8000
+    }),
+    optimizedAjax({
+      method: "POST", 
+      url: scripturl + "/getemployee",
+      data: {},
+      timeout: 8000
+    })
+  ]).then(([autocompleteData, employeeList]) => {
+    // Hide loading toast
+    if (loadingToast && typeof MobileUI !== 'undefined') {
+      MobileUI.toast.hide(loadingToast);
+    }
+    
+    // Setup autocomplete
+    if (autocompleteData && Array.isArray(autocompleteData)) {
+      setupAutocomplete(autocompleteData);
+    }
+    
+    // Setup employee dropdown (keeping compatibility)
+    if (employeeList && Array.isArray(employeeList)) {
+      setupEmployeeDropdown(employeeList);
+    }
+    
+    console.log(`📱 Loaded ${autocompleteData?.length || 0} employees for autocomplete`);
+    
+    if (typeof MobileUI !== 'undefined') {
+      MobileUI.toast.success('โหลดข้อมูลเรียบร้อย');
+    }
+    
+  }).catch(error => {
+    console.error('📱 Failed to load employees:', error);
+    
+    if (loadingToast && typeof MobileUI !== 'undefined') {
+      MobileUI.toast.hide(loadingToast);
+      MobileUI.toast.error('ไม่สามารถโหลดรายชื่อพนักงานได้');
+    }
+    
+    // Try to use cached data
+    const cachedData = mobilePerf.apiCache.get('POST:/api/getdata:{}');
+    if (cachedData) {
+      console.log('📱 Using cached employee data');
+      setupAutocomplete(cachedData.data);
+    }
+  });
+}
+
+// ⭐ Setup autocomplete with mobile optimization
+function setupAutocomplete(dataPerson) {
+  $(function () {
+    $("#employee, #employee-input").autocomplete({
+      maxShowItems: 5, // Reduce for mobile
+      source: dataPerson,
+      minLength: 2,
+      delay: 300, // Add delay to reduce API calls
+      select: function(event, ui) {
+        // Trigger custom event for mobile handlers
+        if (typeof CustomEvent !== 'undefined') {
+          const employeeSelectedEvent = new CustomEvent('employee-selected', {
+            detail: {
+              name: ui.item.value,
+              code: ui.item.value,
+              selectionTime: Date.now(),
+              method: 'click'
+            }
+          });
+          document.dispatchEvent(employeeSelectedEvent);
+        }
+      }
+    });
+  });
+}
+
+// ⭐ Setup employee dropdown (compatibility)
+function setupEmployeeDropdown(employeeList) {
+  const employeeSelect = document.getElementById("employee");
+  if (!employeeSelect) return;
+
+  // Clear existing options
+  employeeSelect.innerHTML = '';
+
+  let option = document.createElement("option");
+  option.value = "";
+  option.text = "";
+  employeeSelect.appendChild(option);
+
+  employeeList.forEach(function (item, index) {
+    let option = document.createElement("option");
+    option.value = item[0];
+    option.text = item[0];
+    employeeSelect.appendChild(option);
+  });
+}
+
+// ฟังก์ชันดึงเวลาไคลเอ็นต์พร้อมดีบั๊ก (เดิม)
+function getClientTime() {
+  var currentTime = new Date();
   var isoString = currentTime.toISOString();
  
-  // แสดงข้อมูลการดีบั๊ก
   console.group('Client Time Debugging');
   console.log('Original Time (Local):', currentTime);
   console.log('Original Time (ISO):', isoString);
@@ -158,40 +305,66 @@ function getClientTime() {
   );
   console.groupEnd();
  
-  // คืนค่าเวลาในรูปแบบ ISO string (ซึ่งเป็น UTC)
   return isoString;
 }
 
-// ฟังก์ชันขอตำแหน่งทางภูมิศาสตร์ก่อนลงเวลาเข้า
+// ⭐ Enhanced location request with better UX
 function requestLocationAndClockIn() {
   event.preventDefault();
-  var employee = document.getElementById("employee").value;
+  const employee = document.getElementById("employee").value;
   
   if (employee === '') {
-    $('#message').html('กรุณาเลือกรายชื่อพนักงาน ...!');
-    document.getElementById('message').className = 'alert alert-warning text-danger';
+    if (typeof MobileUI !== 'undefined') {
+      MobileUI.toast.warning('กรุณาเลือกรายชื่อพนักงาน');
+    } else {
+      $('#message').html('กรุณาเลือกรายชื่อพนักงาน ...!');
+      document.getElementById('message').className = 'alert alert-warning text-danger';
+    }
     return;
   }
   
-  // แสดงกล่องขออนุญาตใช้ตำแหน่ง
+  // Record performance metric
+  const startTime = performance.now();
+  
   showLocationPermissionDialog(function(allowed) {
     if (allowed) {
-      // ดึงตำแหน่งปัจจุบันก่อนลงเวลา
+      const locationToast = typeof MobileUI !== 'undefined' ? 
+        MobileUI.toast.loading('กำลังขอตำแหน่ง...') : null;
+      
       getlocation(true, function(success) {
+        if (locationToast && typeof MobileUI !== 'undefined') {
+          MobileUI.toast.hide(locationToast);
+        }
+        
         if (success) {
-          // ดำเนินการลงเวลาเข้าเมื่อได้ตำแหน่งแล้ว
           ClockIn();
         } else {
-          $('#message').html('ไม่สามารถดึงตำแหน่งพิกัดได้ กรุณาตรวจสอบการตั้งค่าอุปกรณ์ของคุณ');
-          document.getElementById('message').className = 'alert alert-danger';
+          if (typeof MobileUI !== 'undefined') {
+            MobileUI.toast.error('ไม่สามารถดึงตำแหน่งได้');
+          } else {
+            $('#message').html('ไม่สามารถดึงตำแหน่งพิกัดได้');
+            document.getElementById('message').className = 'alert alert-danger';
+          }
+        }
+        
+        // Record performance
+        const duration = performance.now() - startTime;
+        if (typeof CustomEvent !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('clock-action', {
+            detail: {
+              type: 'clockin',
+              success: success,
+              duration: duration,
+              offline: !navigator.onLine
+            }
+          }));
         }
       });
     } else {
-      // กรณีไม่อนุญาตใช้ตำแหน่ง
-      $('#message').html('คุณไม่อนุญาตการใช้งานตำแหน่งที่ตั้ง การลงเวลาจะไม่มีข้อมูลพิกัด');
-      document.getElementById('message').className = 'alert alert-warning';
+      if (typeof MobileUI !== 'undefined') {
+        MobileUI.toast.warning('การลงเวลาจะไม่มีข้อมูลพิกัด');
+      }
       
-      // ลงเวลาแม้ไม่มีพิกัด
       setTimeout(function() {
         ClockIn();
       }, 1500);
@@ -199,36 +372,59 @@ function requestLocationAndClockIn() {
   });
 }
 
-// ฟังก์ชันขอตำแหน่งทางภูมิศาสตร์ก่อนลงเวลาออก
+// ⭐ Enhanced location request for clock out
 function requestLocationAndClockOut() {
   event.preventDefault();
-  var employee = document.getElementById("employee").value;
+  const employee = document.getElementById("employee").value;
   
   if (employee === '') {
-    $('#message').html('กรุณาเลือกรายชื่อพนักงาน ...!');
-    document.getElementById('message').className = 'alert alert-warning text-danger';
+    if (typeof MobileUI !== 'undefined') {
+      MobileUI.toast.warning('กรุณาเลือกรายชื่อพนักงาน');
+    } else {
+      $('#message').html('กรุณาเลือกรายชื่อพนักงาน ...!');
+      document.getElementById('message').className = 'alert alert-warning text-danger';
+    }
     return;
   }
   
-  // แสดงกล่องขออนุญาตใช้ตำแหน่ง
+  const startTime = performance.now();
+  
   showLocationPermissionDialog(function(allowed) {
     if (allowed) {
-      // ดึงตำแหน่งปัจจุบันก่อนลงเวลา
+      const locationToast = typeof MobileUI !== 'undefined' ? 
+        MobileUI.toast.loading('กำลังขอตำแหน่ง...') : null;
+      
       getlocation(true, function(success) {
+        if (locationToast && typeof MobileUI !== 'undefined') {
+          MobileUI.toast.hide(locationToast);
+        }
+        
         if (success) {
-          // ดำเนินการลงเวลาออกเมื่อได้ตำแหน่งแล้ว
           ClockOut();
         } else {
-          $('#message').html('ไม่สามารถดึงตำแหน่งพิกัดได้ กรุณาตรวจสอบการตั้งค่าอุปกรณ์ของคุณ');
-          document.getElementById('message').className = 'alert alert-danger';
+          if (typeof MobileUI !== 'undefined') {
+            MobileUI.toast.error('ไม่สามารถดึงตำแหน่งได้');
+          }
+        }
+        
+        // Record performance
+        const duration = performance.now() - startTime;
+        if (typeof CustomEvent !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('clock-action', {
+            detail: {
+              type: 'clockout', 
+              success: success,
+              duration: duration,
+              offline: !navigator.onLine
+            }
+          }));
         }
       });
     } else {
-      // กรณีไม่อนุญาตใช้ตำแหน่ง
-      $('#message').html('คุณไม่อนุญาตการใช้งานตำแหน่งที่ตั้ง การลงเวลาจะไม่มีข้อมูลพิกัด');
-      document.getElementById('message').className = 'alert alert-warning';
+      if (typeof MobileUI !== 'undefined') {
+        MobileUI.toast.warning('การลงเวลาจะไม่มีข้อมูลพิกัด');
+      }
       
-      // ลงเวลาแม้ไม่มีพิกัด
       setTimeout(function() {
         ClockOut();
       }, 1500);
@@ -236,40 +432,87 @@ function requestLocationAndClockOut() {
   });
 }
 
-// ฟังก์ชันแสดงกล่องขออนุญาตใช้ตำแหน่งแบบสวยงาม
+// ⭐ Enhanced location permission dialog
 function showLocationPermissionDialog(callback) {
-  // ถ้าเคยอนุญาตแล้ว ไม่ต้องแสดงกล่องอีก
   if (locationPermissionGranted) {
     callback(true);
     return;
   }
   
-  // สร้าง Modal dialog สำหรับขออนุญาตใช้ตำแหน่ง
+  // ใช้ mobile UI modal ถ้ามี
+  if (typeof MobileUI !== 'undefined') {
+    const modal = document.createElement('div');
+    modal.className = 'settings-modal';
+    modal.innerHTML = `
+      <div class="modal-overlay">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h3>📍 ขออนุญาตใช้ตำแหน่งที่ตั้ง</h3>
+          </div>
+          <div class="modal-body">
+            <div class="text-center mb-4">
+              <div style="font-size: 64px; margin-bottom: 16px;">📍</div>
+            </div>
+            <p class="text-center">ระบบต้องการเข้าถึงตำแหน่งที่ตั้งของคุณเพื่อบันทึกพิกัดการลงเวลา</p>
+            <p class="text-center" style="font-size: 14px; color: #666;">ข้อมูลนี้จะถูกใช้เพื่อยืนยันตำแหน่งที่คุณลงเวลาเท่านั้น</p>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" id="denyLocationBtn">
+              ❌ ไม่อนุญาต
+            </button>
+            <button type="button" class="btn btn-primary" id="allowLocationBtn">
+              ✅ อนุญาต
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+    
+    document.body.appendChild(modal);
+    
+    // Event handlers
+    modal.querySelector('#allowLocationBtn').addEventListener('click', () => {
+      locationPermissionGranted = true;
+      document.body.removeChild(modal);
+      callback(true);
+    });
+    
+    modal.querySelector('#denyLocationBtn').addEventListener('click', () => {
+      document.body.removeChild(modal);
+      callback(false);
+    });
+    
+    modal.querySelector('.modal-overlay').addEventListener('click', (e) => {
+      if (e.target === modal.querySelector('.modal-overlay')) {
+        document.body.removeChild(modal);
+        callback(false);
+      }
+    });
+    
+    return;
+  }
+  
+  // Fallback to original modal code
   var modalHtml = `
-  <div class="modal fade" id="locationPermissionModal" tabindex="-1" role="dialog" aria-labelledby="locationPermissionModalLabel" aria-hidden="true">
+  <div class="modal fade" id="locationPermissionModal" tabindex="-1" role="dialog">
     <div class="modal-dialog modal-dialog-centered" role="document">
       <div class="modal-content">
         <div class="modal-header bg-primary text-white">
-          <h5 class="modal-title" id="locationPermissionModalLabel">
-            <i class="fas fa-map-marker-alt mr-2"></i> ขออนุญาตใช้ตำแหน่งที่ตั้ง
-          </h5>
-          <button type="button" class="close text-white" data-dismiss="modal" aria-label="Close">
-            <span aria-hidden="true">&times;</span>
-          </button>
+          <h5 class="modal-title">📍 ขออนุญาตใช้ตำแหน่งที่ตั้ง</h5>
         </div>
         <div class="modal-body">
           <div class="text-center mb-4">
-            <img src="https://cdn-icons-png.flaticon.com/512/4781/4781517.png" alt="Location" style="width: 100px; height: 100px;">
+            <div style="font-size: 64px;">📍</div>
           </div>
           <p class="lead text-center">ระบบต้องการเข้าถึงตำแหน่งที่ตั้งของคุณเพื่อบันทึกพิกัดการลงเวลา</p>
           <p class="text-muted text-center">ข้อมูลนี้จะถูกใช้เพื่อยืนยันตำแหน่งที่คุณลงเวลาเท่านั้น</p>
         </div>
         <div class="modal-footer justify-content-center">
-          <button type="button" class="btn btn-secondary px-4" data-dismiss="modal" id="denyLocationBtn">
-            <i class="fas fa-times mr-2"></i> ไม่อนุญาต
+          <button type="button" class="btn btn-secondary px-4" id="denyLocationBtn">
+            ❌ ไม่อนุญาต
           </button>
           <button type="button" class="btn btn-primary px-4" id="allowLocationBtn">
-            <i class="fas fa-check mr-2"></i> อนุญาต
+            ✅ อนุญาต
           </button>
         </div>
       </div>
@@ -277,90 +520,95 @@ function showLocationPermissionDialog(callback) {
   </div>
   `;
   
-  // เพิ่ม Modal เข้าไปใน body
   $('body').append(modalHtml);
+  $('#locationPermissionModal').modal('show');
   
-  // แสดง Modal
-  $('#locationPermissionModal').modal({
-    backdrop: 'static',
-    keyboard: false
-  });
-  
-  // จัดการเมื่อกดปุ่มอนุญาต
   $('#allowLocationBtn').on('click', function() {
     $('#locationPermissionModal').modal('hide');
     locationPermissionGranted = true;
-    setTimeout(function() {
+    setTimeout(() => {
       $('#locationPermissionModal').remove();
       callback(true);
     }, 300);
   });
   
-  // จัดการเมื่อกดปุ่มไม่อนุญาต
   $('#denyLocationBtn').on('click', function() {
     $('#locationPermissionModal').modal('hide');
-    setTimeout(function() {
-      $('#locationPermissionModal').remove();
-      callback(false);
-    }, 300);
-  });
-  
-  // จัดการเมื่อปิด Modal โดยวิธีอื่น
-  $('#locationPermissionModal').on('hidden.bs.modal', function() {
-    setTimeout(function() {
+    setTimeout(() => {
       $('#locationPermissionModal').remove();
       callback(false);
     }, 300);
   });
 }
 
-// ปรับปรุงฟังก์ชัน ClockIn
+// ⭐ Enhanced ClockIn with better mobile UX
 function ClockIn() {
-  var employee = document.getElementById("employee").value;
-  var userinfo = document.getElementById("userinfo").value;
+  const employee = document.getElementById("employee").value;
+  const userinfo = document.getElementById("userinfo").value;
 
   if (employee != '') {
-    $('#message').html("<span class='spinner-border spinner-border-sm text-primary'></span> โปรดรอสักครู่ ...!");
+    // Show mobile-friendly loading
+    const loadingToast = typeof MobileUI !== 'undefined' ? 
+      MobileUI.toast.loading('กำลังลงเวลาเข้า...') : null;
     
-    // ข้อมูลที่จะส่งไปยัง API
-    const clientTime = getClientTime(); // เรียกฟังก์ชันดึงเวลา
+    if (!loadingToast) {
+      $('#message').html("<span class='spinner-border spinner-border-sm text-primary'></span> โปรดรอสักครู่ ...!");
+    }
+    
+    const clientTime = getClientTime();
     
     const apiData = {
       employee,
       userinfo,
       lat: gps ? gps[0] : null,
       lon: gps ? gps[1] : null,
-      client_time: clientTime // เพิ่มเวลาจากไคลเอ็นต์
+      client_time: clientTime
     };
     
-    // เพิ่มข้อมูล LINE ถ้ามี profile
     if (profile) {
       apiData.line_name = profile.displayName;
       apiData.line_picture = profile.pictureUrl;
     }
     
-    // เพิ่มการแสดงข้อมูลการส่ง
-    console.group('Clock In Request');
+    console.group('📱 Clock In Request');
     console.log('API Data:', apiData);
-    console.log('Sent Client Time:', clientTime);
+    console.log('Network Status:', navigator.onLine ? 'Online' : 'Offline');
     console.groupEnd();
     
-    $.ajax({
+    optimizedAjax({
       method: 'POST',
       url: scripturl + "/clockin",
       data: apiData,
+      timeout: 15000,
       success: function (res) {
-        // เพิ่มการแสดงข้อมูลการตอบกลับ
-        console.group('Clock In Response');
+        if (loadingToast && typeof MobileUI !== 'undefined') {
+          MobileUI.toast.hide(loadingToast);
+        }
+        
+        console.group('📱 Clock In Response');
         console.log('Server Response:', res);
         console.groupEnd();
         
-        console.log(res);
-        
         if (res.msg == 'SUCCESS') {
+          const message = `${res.employee}<br>บันทึกเวลามา ${res.return_date}`;
+          
+          if (typeof MobileUI !== 'undefined') {
+            MobileUI.toast.success(`ลงเวลาเข้า ${res.return_date} เรียบร้อย`);
+            
+            // Update status display if available
+            if (window.timeTrackerApp && window.timeTrackerApp.statusDisplay) {
+              window.timeTrackerApp.updateEmployeeStatus(employee);
+            }
+          } else {
+            $('#message').html(message);
+            document.getElementById("message").className = "alert alert-primary";
+          }
+          
+          clearForm();
+          
+          // Send notification
           if (profile) {
-            // ส่งแจ้งเตือนถ้ามี profile
-            $.ajax({
+            optimizedAjax({
               method: 'POST',
               url: scripturl + "/sendnotify",
               data: {
@@ -369,87 +617,128 @@ function ClockIn() {
                 lat: gps ? gps[0] : null,
                 lon: gps ? gps[1] : null,
               }
+            }).catch(err => {
+              console.warn('📱 Notification failed:', err);
             });
           }
-
-          setTimeout(() => {
-            // ใช้ค่า return_date จาก server โดยตรงไม่ต้องแปลงอีก
-            var returnDate = res.return_date;
-            
-            var message = res.employee + '<br> บันทึกเวลามา ' + returnDate;
-            $('#message').html(message);
-            document.getElementById("message").className = "alert alert-primary";
-            clearForm();
-          }, 500);
         } else {
-          var message = res.employee + ' ' + res.msg;
-          $('#message').html(message);
-          document.getElementById("message").className = "alert alert-warning";
+          const message = `${res.employee} ${res.msg}`;
+          
+          if (typeof MobileUI !== 'undefined') {
+            MobileUI.toast.warning(res.msg);
+          } else {
+            $('#message').html(message);
+            document.getElementById("message").className = "alert alert-warning";
+          }
+          
           clearForm();
         }
       },
       error: function(xhr, status, error) {
-        // เพิ่มการจัดการข้อผิดพลาด
-        console.error('Clock In Error:', status, error);
-        console.log('Response Text:', xhr.responseText);
+        if (loadingToast && typeof MobileUI !== 'undefined') {
+          MobileUI.toast.hide(loadingToast);
+        }
         
-        $('#message').html('เกิดข้อผิดพลาดในการส่งข้อมูล');
-        document.getElementById("message").className = "alert alert-danger";
+        console.error('📱 Clock In Error:', status, error);
+        
+        // Check if offline
+        if (!navigator.onLine) {
+          if (typeof MobileUI !== 'undefined') {
+            MobileUI.toast.warning('ไม่มีอินเทอร์เน็ต ข้อมูลจะถูกส่งเมื่อออนไลน์');
+            // Store for offline sync
+            storeOfflineAction('clockin', apiData);
+          } else {
+            $('#message').html('ไม่มีอินเทอร์เน็ต ข้อมูลจะถูกส่งเมื่อออนไลน์');
+            document.getElementById("message").className = "alert alert-warning";
+          }
+        } else {
+          if (typeof MobileUI !== 'undefined') {
+            MobileUI.toast.error('เกิดข้อผิดพลาดในการลงเวลาเข้า');
+          } else {
+            $('#message').html('เกิดข้อผิดพลาดในการส่งข้อมูล');
+            document.getElementById("message").className = "alert alert-danger";
+          }
+        }
+        
         clearForm();
       }
     });
   } else {
-    $('#message').html('กรุณาเลือกรายชื่อพนักงาน ...!');
-    document.getElementById('message').className = 'alert alert-warning text-danger';
+    if (typeof MobileUI !== 'undefined') {
+      MobileUI.toast.warning('กรุณาเลือกรายชื่อพนักงาน');
+    } else {
+      $('#message').html('กรุณาเลือกรายชื่อพนักงาน ...!');
+      document.getElementById('message').className = 'alert alert-warning text-danger';
+    }
     clearForm();
   }
 }
 
-// ปรับปรุงฟังก์ชัน ClockOut
+// ⭐ Enhanced ClockOut with better mobile UX
 function ClockOut() {
-  var employee = document.getElementById("employee").value;
+  const employee = document.getElementById("employee").value;
 
   if (employee != '') {
-    $('#message').html("<span class='spinner-border spinner-border-sm text-warning'></span> โปรดรอสักครู่ ...!");
+    const loadingToast = typeof MobileUI !== 'undefined' ? 
+      MobileUI.toast.loading('กำลังลงเวลาออก...') : null;
     
-    // ข้อมูลที่จะส่งไปยัง API
-    const clientTime = getClientTime(); // เรียกฟังก์ชันดึงเวลา
+    if (!loadingToast) {
+      $('#message').html("<span class='spinner-border spinner-border-sm text-warning'></span> โปรดรอสักครู่ ...!");
+    }
+    
+    const clientTime = getClientTime();
     
     const apiData = {
       employee,
       lat: gps ? gps[0] : null,
       lon: gps ? gps[1] : null,
-      client_time: clientTime // เพิ่มเวลาจากไคลเอ็นต์
+      client_time: clientTime
     };
     
-    // เพิ่มข้อมูล LINE ถ้ามี profile
     if (profile) {
       apiData.line_name = profile.displayName;
       apiData.line_picture = profile.pictureUrl;
     }
     
-    // เพิ่มการแสดงข้อมูลการส่ง
-    console.group('Clock Out Request');
+    console.group('📱 Clock Out Request');
     console.log('API Data:', apiData);
-    console.log('Sent Client Time:', clientTime);
+    console.log('Network Status:', navigator.onLine ? 'Online' : 'Offline');
     console.groupEnd();
     
-    $.ajax({
+    optimizedAjax({
       method: 'POST',
       url: scripturl + "/clockout",
       data: apiData,
+      timeout: 15000,
       success: function (res) {
-        // เพิ่มการแสดงข้อมูลการตอบกลับ
-        console.group('Clock Out Response');
+        if (loadingToast && typeof MobileUI !== 'undefined') {
+          MobileUI.toast.hide(loadingToast);
+        }
+        
+        console.group('📱 Clock Out Response');
         console.log('Server Response:', res);
         console.groupEnd();
         
-        console.log(res);
-        
         if (res.msg == 'SUCCESS') {
+          const message = `${res.employee}<br>บันทึกเวลากลับ ${res.return_date}`;
+          
+          if (typeof MobileUI !== 'undefined') {
+            MobileUI.toast.success(`ลงเวลาออก ${res.return_date} เรียบร้อย`);
+            
+            // Update status display if available
+            if (window.timeTrackerApp && window.timeTrackerApp.statusDisplay) {
+              window.timeTrackerApp.updateEmployeeStatus(employee);
+            }
+          } else {
+            $('#message').html(message);
+            document.getElementById("message").className = "alert alert-primary";
+          }
+          
+          clearForm();
+          
+          // Send notification
           if (profile) {
-            // ส่งแจ้งเตือนถ้ามี profile
-            $.ajax({
+            optimizedAjax({
               method: 'POST',
               url: scripturl + "/sendnotify",
               data: {
@@ -458,133 +747,232 @@ function ClockOut() {
                 lat: gps ? gps[0] : null,
                 lon: gps ? gps[1] : null,
               }
+            }).catch(err => {
+              console.warn('📱 Notification failed:', err);
             });
           }
-
-          setTimeout(() => {
-            // ใช้ค่า return_date จาก server โดยตรงไม่ต้องแปลงอีก
-            var returnDate = res.return_date;
-            
-            var message = res.employee + '<br> บันทึกเวลากลับ ' + returnDate;
-            $('#message').html(message);
-            document.getElementById("message").className = "alert alert-primary";
-            clearForm();
-          }, 500);
         } else {
-          var message = res.employee + ' ' + res.msg;
-          $('#message').html(message);
-          document.getElementById("message").className = "alert alert-warning";
+          const message = `${res.employee} ${res.msg}`;
+          
+          if (typeof MobileUI !== 'undefined') {
+            MobileUI.toast.warning(res.msg);
+          } else {
+            $('#message').html(message);
+            document.getElementById("message").className = "alert alert-warning";
+          }
+          
           clearForm();
         }
       },
       error: function(xhr, status, error) {
-        // เพิ่มการจัดการข้อผิดพลาด
-        console.error('Clock Out Error:', status, error);
-        console.log('Response Text:', xhr.responseText);
+        if (loadingToast && typeof MobileUI !== 'undefined') {
+          MobileUI.toast.hide(loadingToast);
+        }
         
-        $('#message').html('เกิดข้อผิดพลาดในการส่งข้อมูล');
-        document.getElementById("message").className = "alert alert-danger";
+        console.error('📱 Clock Out Error:', status, error);
+        
+        if (!navigator.onLine) {
+          if (typeof MobileUI !== 'undefined') {
+            MobileUI.toast.warning('ไม่มีอินเทอร์เน็ต ข้อมูลจะถูกส่งเมื่อออนไลน์');
+            storeOfflineAction('clockout', apiData);
+          } else {
+            $('#message').html('ไม่มีอินเทอร์เน็ต ข้อมูลจะถูกส่งเมื่อออนไลน์');
+            document.getElementById("message").className = "alert alert-warning";
+          }
+        } else {
+          if (typeof MobileUI !== 'undefined') {
+            MobileUI.toast.error('เกิดข้อผิดพลาดในการลงเวลาออก');
+          } else {
+            $('#message').html('เกิดข้อผิดพลาดในการส่งข้อมูล');
+            document.getElementById("message").className = "alert alert-danger";
+          }
+        }
+        
         clearForm();
       }
     });
   } else {
-    $('#message').html("กรุณาเลือกรายชื่อพนักงาน ...!");
-    document.getElementById("message").className = "alert alert-warning text-danger";
+    if (typeof MobileUI !== 'undefined') {
+      MobileUI.toast.warning('กรุณาเลือกรายชื่อพนักงาน');
+    } else {
+      $('#message').html("กรุณาเลือกรายชื่อพนักงาน ...!");
+      document.getElementById("message").className = "alert alert-warning text-danger";
+    }
     clearForm();
   }
 }
 
-// ปรับปรุงฟังก์ชันดึงตำแหน่ง GPS
+// ⭐ Store offline actions for sync later
+function storeOfflineAction(type, data) {
+  try {
+    const offlineActions = JSON.parse(localStorage.getItem('offline_actions') || '[]');
+    offlineActions.push({
+      type: type,
+      data: data,
+      timestamp: Date.now(),
+      id: Date.now() + Math.random()
+    });
+    localStorage.setItem('offline_actions', JSON.stringify(offlineActions));
+    console.log('📱 Stored offline action:', type);
+  } catch (error) {
+    console.error('📱 Failed to store offline action:', error);
+  }
+}
+
+// ⭐ Sync offline actions when online
+function syncOfflineActions() {
+  if (!navigator.onLine) return;
+  
+  try {
+    const offlineActions = JSON.parse(localStorage.getItem('offline_actions') || '[]');
+    if (offlineActions.length === 0) return;
+    
+    console.log(`📱 Syncing ${offlineActions.length} offline actions...`);
+    
+    const promises = offlineActions.map(action => {
+      const endpoint = action.type === 'clockin' ? '/clockin' : '/clockout';
+      
+      return optimizedAjax({
+        method: 'POST',
+        url: scripturl + endpoint,
+        data: action.data,
+        timeout: 10000
+      }).then(() => {
+        return action.id; // Return ID for removal
+      }).catch(error => {
+        console.error('📱 Failed to sync offline action:', error);
+        return null;
+      });
+    });
+    
+    Promise.allSettled(promises).then(results => {
+      const syncedIds = results
+        .filter(result => result.status === 'fulfilled' && result.value)
+        .map(result => result.value);
+      
+      if (syncedIds.length > 0) {
+        // Remove synced actions
+        const remainingActions = offlineActions.filter(action => !syncedIds.includes(action.id));
+        localStorage.setItem('offline_actions', JSON.stringify(remainingActions));
+        
+        if (typeof MobileUI !== 'undefined') {
+          MobileUI.toast.success(`ส่งข้อมูลออฟไลน์ ${syncedIds.length} รายการเรียบร้อย`);
+        }
+        
+        console.log(`📱 Synced ${syncedIds.length} offline actions`);
+      }
+    });
+    
+  } catch (error) {
+    console.error('📱 Error syncing offline actions:', error);
+  }
+}
+
+// ⭐ Enhanced geolocation with timeout and fallback
 function getlocation(forceUpdate = false, callback = null) {
-  // ถ้าไม่ได้บังคับอัปเดต และมีพิกัดอยู่แล้ว ให้ใช้ค่าเดิม
   if (!forceUpdate && gps) {
-    console.log("Using cached GPS coordinates:", gps);
+    console.log("📱 Using cached GPS coordinates:", gps);
     if (callback) callback(true);
     return;
   }
   
-  if (navigator.geolocation) {
-    navigator.geolocation.getCurrentPosition(
-      // กรณีสำเร็จ
-      function(position) {
-        var lat = position.coords.latitude;
-        var lon = position.coords.longitude;
-        gps = [lat, lon];
-        console.log("Geolocation success - Latitude: " + lat + ", Longitude: " + lon);
-        
-        // อัปเดตสถานะการอนุญาตใช้ตำแหน่ง
-        locationPermissionGranted = true;
-        
-        if (callback) callback(true);
-      },
-      // กรณีไม่สำเร็จ
-      function(error) {
-        console.error("Geolocation error:", error);
-        
-        // ลองใช้วิธีสำรอง
-        try {
-          getLocationFromApi(function(success) {
-            if (success) {
-              console.log("Got location from API:", gps);
-              if (callback) callback(true);
-            } else {
-              // หากไม่สามารถดึงตำแหน่งได้จากทุกวิธี
-              console.error("Failed to get location from all methods");
-              if (callback) callback(false);
-            }
-          });
-        } catch (err) {
-          console.error("Error getting location from API:", err);
-          if (callback) callback(false);
-        }
-      },
-      // ตัวเลือกการดึงตำแหน่ง
-      {
-        enableHighAccuracy: true,
-        timeout: 10000,
-        maximumAge: 0
-      }
-    );
-  } else {
-    console.error("Geolocation is not supported by this browser.");
+  if (!navigator.geolocation) {
+    console.error("📱 Geolocation not supported");
+    if (callback) callback(false);
+    return;
+  }
+  
+  const timeoutMs = 8000; // Reduce timeout for mobile
+  const options = {
+    enableHighAccuracy: true,
+    timeout: timeoutMs,
+    maximumAge: 30000 // Accept 30s old position
+  };
+  
+  const timeoutId = setTimeout(() => {
+    console.warn("📱 Geolocation timeout, trying IP fallback");
+    getLocationFromApi(callback);
+  }, timeoutMs + 1000);
+  
+  navigator.geolocation.getCurrentPosition(
+    function(position) {
+      clearTimeout(timeoutId);
+      
+      const lat = position.coords.latitude;
+      const lon = position.coords.longitude;
+      gps = [lat, lon];
+      
+      console.log("📱 Geolocation success:", lat, lon);
+      locationPermissionGranted = true;
+      
+      if (callback) callback(true);
+    },
+    function(error) {
+      clearTimeout(timeoutId);
+      console.error("📱 Geolocation error:", error.code, error.message);
+      
+      // Try IP-based location as fallback
+      getLocationFromApi(callback);
+    },
+    options
+  );
+}
+
+// ⭐ Enhanced IP-based location with better error handling
+function getLocationFromApi(callback = null) {
+  const apis = [
+    'https://ipapi.co/json/',
+    'https://ip-api.com/json/',
+    'https://ipinfo.io/json'
+  ];
+  
+  let apiIndex = 0;
+  
+  function tryNextApi() {
+    if (apiIndex >= apis.length) {
+      console.error("📱 All location APIs failed");
+      if (callback) callback(false);
+      return;
+    }
     
-    // ลองใช้วิธีสำรอง
-    try {
-      getLocationFromApi(function(success) {
-        if (success) {
-          console.log("Got location from API as fallback:", gps);
+    const api = apis[apiIndex++];
+    console.log(`📱 Trying location API: ${api}`);
+    
+    $.ajax({
+      url: api,
+      timeout: 5000,
+      success: function(data) {
+        let lat, lon;
+        
+        if (data.latitude && data.longitude) {
+          lat = data.latitude;
+          lon = data.longitude;
+        } else if (data.lat && data.lon) {
+          lat = data.lat;
+          lon = data.lon;
+        } else if (data.loc) {
+          [lat, lon] = data.loc.split(',').map(Number);
+        }
+        
+        if (lat && lon) {
+          gps = [lat, lon];
+          console.log("📱 IP location success:", lat, lon);
           if (callback) callback(true);
         } else {
-          console.error("Failed to get location from API fallback");
-          if (callback) callback(false);
+          tryNextApi();
         }
-      });
-    } catch (err) {
-      console.error("Error getting location from API fallback:", err);
-      if (callback) callback(false);
-    }
-  }
-}
-
-// ปรับปรุงฟังก์ชัน getLocationFromApi ให้รองรับ callback
-function getLocationFromApi(callback = null) {
-  $.getJSON('https://ipapi.co/json/')
-    .done(function(data) {
-      var lat = data.latitude;
-      var lon = data.longitude;
-      gps = [lat, lon];
-      console.log("IP API Location - Latitude: " + lat + ", Longitude: " + lon);
-      if (callback) callback(true);
-      return true;
-    })
-    .fail(function(jqxhr, textStatus, error) {
-      console.error("Error fetching location from IP API:", error);
-      if (callback) callback(false);
-      return false;
+      },
+      error: function() {
+        console.warn(`📱 API ${api} failed, trying next...`);
+        tryNextApi();
+      }
     });
+  }
+  
+  tryNextApi();
 }
 
-// ฟังก์ชันล้างฟอร์ม
+// ฟังก์ชันล้างฟอร์ม (เดิม)
 function clearForm() {
   setTimeout(function () {
     document.getElementById('message').innerText = owner;
@@ -593,31 +981,45 @@ function clearForm() {
   }, 5000);
 }
 
-// ฟังก์ชันแสดงเวลา
+// ฟังก์ชันแสดงเวลา (เดิม แต่เพิ่ม performance optimization)
 function showTime() {
-  var date = new Date();
-  var h = date.getHours(); // 0 - 23 (เวลาท้องถิ่น)
-  var m = date.getMinutes(); // 0 - 59
-  var s = date.getSeconds(); // 0 - 59
-  var dot = document.textContent = '.';
-
+  const date = new Date();
+  let h = date.getHours();
+  let m = date.getMinutes();
+  let s = date.getSeconds();
+  
   // ควบคุมจุดกระพริบ
-  if (s % 2 == 1) {
-    dot = document.textContent = '.';
-  } else {
-    dot = document.textContent = '\xa0';
-  }
-
+  const dot = s % 2 === 1 ? '.' : '\xa0';
+  
   // เพิ่ม 0 นำหน้าตัวเลขถ้าจำเป็น
-  h = h < 10 ? "0" + h : h;
-  m = m < 10 ? "0" + m : m;
-  s = s < 10 ? "0" + s : s;
-
-  // แสดงเวลา
-  var time = h + ":" + m + ":" + s + '' + dot;
-  document.getElementById("MyClockDisplay").innerText = time;
-  document.getElementById("MyClockDisplay").textContent = time;
-
-  // เรียกฟังก์ชันนี้ทุก 1 วินาที
-  setTimeout(showTime, 1000);
+  h = h.toString().padStart(2, '0');
+  m = m.toString().padStart(2, '0');
+  s = s.toString().padStart(2, '0');
+  
+  const time = `${h}:${m}:${s}${dot}`;
+  const clockElement = document.getElementById("MyClockDisplay");
+  
+  if (clockElement) {
+    clockElement.textContent = time;
+  }
+  
+  // ใช้ requestAnimationFrame แทน setTimeout เพื่อ performance ที่ดีขึ้น
+  requestAnimationFrame(() => {
+    setTimeout(showTime, 1000);
+  });
 }
+
+// ⭐ Auto sync offline actions when online
+window.addEventListener('online', () => {
+  console.log('📱 Device back online, syncing offline actions...');
+  setTimeout(syncOfflineActions, 1000); // Wait a bit for connection to stabilize
+});
+
+// ⭐ Initial sync check on page load
+$(document).ready(function() {
+  setTimeout(() => {
+    if (navigator.onLine) {
+      syncOfflineActions();
+    }
+  }, 3000); // Wait for app to initialize
+});

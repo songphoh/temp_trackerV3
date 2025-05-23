@@ -1,152 +1,402 @@
+// server.js - Mobile Time Tracker Server (ส่วนที่ 1/8)
+// Dependencies และ Initial Setup
+
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
+// ⭐ Core Dependencies
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const compression = require('compression');
 const path = require('path');
 const axios = require('axios');
-const { Pool } = require('pg'); // เปลี่ยนจาก sqlite3 เป็น pg
-const fs = require('fs');
 
-// กำหนดโซนเวลาให้กับเซิร์ฟเวอร์
+// ⭐ Security & Performance Dependencies
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+require('dotenv').config();
+
+// ⭐ Database Connection (ใช้ optimized pool)
+const db = require('./db-pool-optimized');
+
+// ⭐ Environment Setup
 process.env.TZ = 'Asia/Bangkok';
 
-// ตรวจสอบโซนเวลาปัจจุบันของเซิร์ฟเวอร์
+console.log('🚀 Starting Mobile Time Tracker Server...');
 console.log('Server Timezone:', process.env.TZ);
 console.log('Current server time:', new Date().toString());
 console.log('Current server time (ISO):', new Date().toISOString());
 console.log('Current server time (Locale):', new Date().toLocaleString('th-TH'));
+console.log('Environment:', process.env.NODE_ENV || 'development');
 
+// ⭐ Express App Configuration
 const app = express();
 const port = process.env.PORT || 3000;
+
+// ⭐ Security Middleware
+app.use(helmet({
+  contentSecurityPolicy: false, // ปิดเพื่อให้ PWA ทำงานได้
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
+// ⭐ Mobile Client Detection Middleware
+app.use((req, res, next) => {
+  const isMobile = req.headers['x-mobile-client'] === 'true' || 
+                   /Mobile|Android|iPhone|iPad/i.test(req.headers['user-agent'] || '');
+  
+  req.isMobile = isMobile;
+  
+  // เพิ่ม headers สำหรับ Mobile PWA
+  if (isMobile) {
+    res.set({
+      'Cache-Control': 'public, max-age=300', // 5 minutes cache
+      'X-Mobile-Optimized': 'true',
+      'X-Content-Type-Options': 'nosniff'
+    });
+  }
+  
+  next();
+});
+
+// ⭐ Compression Middleware
+app.use(compression({
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) {
+      return false;
+    }
+    return compression.filter(req, res);
+  },
+  level: 6,
+  threshold: 1024
+}));
+
+// ⭐ Performance Monitoring Middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (duration > 2000) {
+      console.warn(`🐌 Slow request: ${req.method} ${req.url} took ${duration}ms`);
+    } else if (duration > 1000) {
+      console.log(`⚠️ Long request: ${req.method} ${req.url} took ${duration}ms`);
+    }
+  });
+  
+  next();
+});
+
+// ⭐ Debug Router
 const debugRouter = require('./debug');
 app.use('/debug', debugRouter);
 
-// กำหนดค่า connection string สำหรับ PostgreSQL
-// ใช้ environment variables สำหรับการเชื่อมต่อ (สำคัญสำหรับการ deploy)
-//const connectionString =process.env.DATABASE_URL ||"postgres://avnadmin:AVNS_f55VsqPVus0il98ErN3@pg-3c45e39d-nammunla1996-5f87.j.aivencloud.com:27540/defaultdb?sslmode=require";
-const connectionString = process.env.DATABASE_URL || "postgresql://postgres.ofzfxbhzkvrumsgrgogq:%40Songphon544942@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres";
+// ⭐ CORS Configuration
+const corsOptions = {
+  origin: function (origin, callback) {
+    const allowedOrigins = [
+      'http://localhost:3000',
+      'https://your-domain.com', // เปลี่ยนเป็น domain จริง
+      'capacitor://localhost', // สำหรับ Capacitor apps
+      'ionic://localhost' // สำหรับ Ionic apps
+    ];
+    
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(null, true); // อนุญาตทุก origin ใน development
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Mobile-Client']
+};
 
-// สร้าง connection pool
-let pool;
-function getPool() {
-  if (!pool) {
-    pool = new Pool({
-      connectionString,
-      ssl: {
-        rejectUnauthorized: false,
-        checkServerIdentity: () => undefined
-      },
-      connectionTimeoutMillis: 15000,
-      timezone: 'Asia/Bangkok',
-      max: 1, // สำหรับ serverless
-      idleTimeoutMillis: 30000
+app.use(cors(corsOptions));
+
+// ⭐ Body Parser Middleware
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
+
+// ⭐ Static Files Serving
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/admin', express.static(path.join(__dirname, 'public', 'admin')));
+
+// ⭐ PWA Static Files
+app.use('/manifest.json', express.static(path.join(__dirname, 'public', 'manifest.json')));
+app.use('/sw.js', express.static(path.join(__dirname, 'public', 'sw.js')));
+app.use('/js', express.static(path.join(__dirname, 'public', 'js')));
+app.use('/css', express.static(path.join(__dirname, 'public', 'css')));
+
+// ⭐ Request Logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} | ${req.method} ${req.url}`);
+  next();
+});
+
+// ⭐ Security Headers Middleware
+app.use((req, res, next) => {
+  // Security headers
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'X-XSS-Protection': '1; mode=block',
+    'Referrer-Policy': 'strict-origin-when-cross-origin'
+  });
+  
+  // PWA specific headers
+  if (req.path === '/manifest.json') {
+    res.set('Content-Type', 'application/manifest+json');
+  }
+  
+  if (req.path === '/sw.js') {
+    res.set({
+      'Content-Type': 'application/javascript',
+      'Service-Worker-Allowed': '/'
     });
   }
-  return pool;
-}
+  
+  next();
+});
 
-// ทดสอบการเชื่อมต่อ
-getPool().query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('ไม่สามารถเชื่อมต่อฐานข้อมูลได้:', err.message);
-  } else {
-    console.log('เชื่อมต่อฐานข้อมูลสำเร็จ เวลาปัจจุบันของ server:', res.rows[0].now);
-    initializeDatabase();
+// server.js - Mobile Time Tracker Server (ส่วนที่ 2/8)
+// Rate Limiting และ Cache Setup
+
+// ⭐ Rate Limiting Configuration
+const mobileApiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // จำกัด 100 requests ต่อ 15 นาที
+  message: {
+    success: false,
+    message: 'Too many requests, please try again later.'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => {
+    // ไม่จำกัดสำหรับ health check
+    return req.path === '/health' || req.path === '/metrics';
   }
 });
 
-// ฟังก์ชันสำหรับปรับเวลาให้เป็นเวลาในประเทศไทย (GMT+7)
-function getThaiTime() {
-  const now = new Date();
-  // ปรับเวลาให้เป็นเวลาในประเทศไทย (GMT+7)
-  const thaiTime = new Date(now.getTime() + (7 * 60 * 60 * 1000));
-  return thaiTime.toISOString();
+const clockActionLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 10, // จำกัด 10 requests ต่อ 5 นาที
+  message: {
+    success: false,
+    message: 'Too many clock actions, please wait before trying again.'
+  },
+  keyGenerator: (req) => {
+    // ใช้ employee name + IP เป็น key
+    return `${req.body.employee || 'unknown'}-${req.ip}`;
+  }
+});
+
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 50, // จำกัด 50 requests ต่อ 15 นาที สำหรับ admin
+  message: {
+    success: false,
+    message: 'Too many admin requests, please try again later.'
+  }
+});
+
+// ⭐ Apply Rate Limiting
+app.use('/api/mobile', mobileApiLimiter);
+app.use('/api/admin', adminLimiter);
+app.use('/api/clockin', clockActionLimiter);
+app.use('/api/clockout', clockActionLimiter);
+
+// ⭐ Cache Configuration สำหรับข้อมูลที่ไม่เปลี่ยนแปลงบ่อย
+let employeeCache = null;
+let employeeCacheTime = 0;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 นาที
+
+// ⭐ Mobile Performance Cache
+let mobilePerf = {
+  apiCache: new Map(),
+  requestQueue: [],
+  isProcessing: false,
+  retryCount: 0,
+  maxRetries: 3
+};
+
+// ⭐ Employee Cache Functions
+async function getEmployeesFromCache() {
+  const now = Date.now();
+  if (!employeeCache || (now - employeeCacheTime) > CACHE_DURATION) {
+    console.log('🔄 Refreshing employee cache...');
+    
+    try {
+      const result = await db.executePrepared('GET_ACTIVE_EMPLOYEES', ['active']);
+      employeeCache = result.rows.map(e => [e.full_name, e.emp_code]);
+      employeeCacheTime = now;
+      console.log(`📋 Cached ${employeeCache.length} employees`);
+    } catch (error) {
+      console.error('❌ Error refreshing employee cache:', error);
+      // ใช้ cache เก่าถ้ามี
+      if (!employeeCache) {
+        employeeCache = [];
+      }
+    }
+  }
+  return employeeCache;
 }
 
-// ฟังก์ชันสร้างตารางและข้อมูลเริ่มต้น
-async function initializeDatabase() {
-  console.log('กำลังตรวจสอบและสร้างตาราง...');
-  
-  const client = await pool.connect();
-  
-  try {
-    // เริ่ม transaction
-    await client.query('BEGIN');
-    
-    // สร้างตารางเก็บรายชื่อพนักงาน
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS employees (
-        id SERIAL PRIMARY KEY,
-        emp_code TEXT NOT NULL UNIQUE,
-        full_name TEXT NOT NULL,
-        position TEXT,
-        department TEXT,
-        line_id TEXT,
-        line_name TEXT,
-        line_picture TEXT,
-        status TEXT DEFAULT 'active',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-    console.log('ตาราง employees สร้างหรือมีอยู่แล้ว');
+// ⭐ ฟังก์ชันล้าง cache
+function clearEmployeeCache() {
+  employeeCache = null;
+  employeeCacheTime = 0;
+  console.log('🧹 Employee cache cleared');
+}
 
-    // สร้างตารางเก็บบันทึกเวลา
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS time_logs (
-        id SERIAL PRIMARY KEY,
-        employee_id INTEGER NOT NULL,
-        clock_in TIMESTAMP,
-        clock_out TIMESTAMP,
-        note TEXT,
-        latitude_in REAL,
-        longitude_in REAL,
-        latitude_out REAL,
-        longitude_out REAL,
-        line_id TEXT,
-        line_name TEXT,
-        line_picture TEXT,
-        status TEXT DEFAULT 'normal',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (employee_id) REFERENCES employees(id)
-      )
-    `);
-    console.log('ตาราง time_logs สร้างหรือมีอยู่แล้ว');
+// ⭐ API Cache Helper Functions
+function setApiCache(key, data, ttl = 30000) {
+  mobilePerf.apiCache.set(key, {
+    data,
+    expires: Date.now() + ttl
+  });
+}
 
-    // สร้างตารางเก็บค่า settings
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS settings (
-        id SERIAL PRIMARY KEY,
-        setting_name TEXT NOT NULL UNIQUE,
-        setting_value TEXT,
-        description TEXT
-      )
-    `);
-    console.log('ตาราง settings สร้างหรือมีอยู่แล้ว');
-    
-    // Commit transaction
-    await client.query('COMMIT');
-    
-    // ตรวจสอบและเพิ่มข้อมูลเริ่มต้น
-    await addInitialSettings(client);
-    await addSampleEmployees(client);
-    
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Error initializing database:', err.message);
-  } finally {
-    client.release();
+function getApiCache(key) {
+  const cached = mobilePerf.apiCache.get(key);
+  if (!cached) return null;
+  
+  if (Date.now() > cached.expires) {
+    mobilePerf.apiCache.delete(key);
+    return null;
+  }
+  
+  return cached.data;
+}
+
+function clearApiCache() {
+  mobilePerf.apiCache.clear();
+  console.log('🧹 API cache cleared');
+}
+
+// ⭐ Cleanup Old Cache Entries
+function cleanupOldCache() {
+  const now = Date.now();
+  let cleanedCount = 0;
+  
+  for (const [key, value] of mobilePerf.apiCache.entries()) {
+    if (now > value.expires) {
+      mobilePerf.apiCache.delete(key);
+      cleanedCount++;
+    }
+  }
+  
+  if (cleanedCount > 0) {
+    console.log(`🧹 Cleaned ${cleanedCount} expired cache entries`);
   }
 }
 
-// เพิ่มข้อมูลการตั้งค่าเริ่มต้น
-async function addInitialSettings(client) {
+// รัน cache cleanup ทุก 5 นาที
+setInterval(cleanupOldCache, 5 * 60 * 1000);
+
+// server.js - Mobile Time Tracker Server (ส่วนที่ 3/8)
+// Database Initialization และ Helper Functions
+
+// ⭐ เตรียมฐานข้อมูล
+async function initializeDatabase() {
+  console.log('🚀 กำลังตรวจสอบและสร้างตาราง...');
+  
   try {
-    // ตรวจสอบว่ามีข้อมูลในตาราง settings หรือไม่
-    const countResult = await getPool().query('SELECT COUNT(*) as count FROM settings');
+    await db.withTransaction(async (client) => {
+      // สร้างตาราง employees
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS employees (
+          id SERIAL PRIMARY KEY,
+          emp_code TEXT NOT NULL UNIQUE,
+          full_name TEXT NOT NULL,
+          position TEXT,
+          department TEXT,
+          line_id TEXT,
+          line_name TEXT,
+          line_picture TEXT,
+          status TEXT DEFAULT 'active',
+          mobile_enabled BOOLEAN DEFAULT true,
+          last_mobile_login TIMESTAMP,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      console.log('✅ ตาราง employees สร้างหรือมีอยู่แล้ว');
+
+      // สร้างตาราง time_logs
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS time_logs (
+          id SERIAL PRIMARY KEY,
+          employee_id INTEGER NOT NULL,
+          clock_in TIMESTAMP,
+          clock_out TIMESTAMP,
+          note TEXT,
+          latitude_in REAL,
+          longitude_in REAL,
+          latitude_out REAL,
+          longitude_out REAL,
+          line_id TEXT,
+          line_name TEXT,
+          line_picture TEXT,
+          status TEXT DEFAULT 'normal',
+          sync_status TEXT DEFAULT 'synced',
+          mobile_device_id TEXT,
+          app_version TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (employee_id) REFERENCES employees(id)
+        )
+      `);
+      console.log('✅ ตาราง time_logs สร้างหรือมีอยู่แล้ว');
+
+      // สร้างตาราง settings
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS settings (
+          id SERIAL PRIMARY KEY,
+          setting_name TEXT NOT NULL UNIQUE,
+          setting_value TEXT,
+          description TEXT
+        )
+      `);
+      console.log('✅ ตาราง settings สร้างหรือมีอยู่แล้ว');
+
+      // ⭐ สร้าง indexes สำหรับ Mobile performance
+      await client.query(`
+        -- Index สำหรับการค้นหาพนักงาน
+        CREATE INDEX IF NOT EXISTS idx_employees_emp_code ON employees(emp_code);
+        CREATE INDEX IF NOT EXISTS idx_employees_full_name ON employees(full_name);
+        CREATE INDEX IF NOT EXISTS idx_employees_status ON employees(status);
+        CREATE INDEX IF NOT EXISTS idx_employees_search ON employees(LOWER(full_name), LOWER(emp_code)) WHERE status = 'active';
+        
+        -- Index สำหรับการค้นหา time logs
+        CREATE INDEX IF NOT EXISTS idx_time_logs_employee_id ON time_logs(employee_id);
+        CREATE INDEX IF NOT EXISTS idx_time_logs_clock_in_date ON time_logs(DATE(clock_in));
+        CREATE INDEX IF NOT EXISTS idx_time_logs_employee_date ON time_logs(employee_id, DATE(clock_in));
+        CREATE INDEX IF NOT EXISTS idx_time_logs_employee_today ON time_logs(employee_id, DATE(clock_in), clock_in DESC);
+        CREATE INDEX IF NOT EXISTS idx_time_logs_status_check ON time_logs(employee_id, clock_in DESC) WHERE clock_out IS NULL;
+        
+        -- Index สำหรับ settings
+        CREATE INDEX IF NOT EXISTS idx_settings_name ON settings(setting_name);
+      `);
+      
+      console.log('✅ Database tables and indexes created');
+    });
+    
+    await addInitialSettings();
+    await addSampleEmployees();
+    
+    console.log('✅ เตรียมฐานข้อมูลเสร็จสมบูรณ์');
+  } catch (err) {
+    console.error('❌ Error initializing database:', err.message);
+    throw err;
+  }
+}
+
+// ⭐ เพิ่มข้อมูลการตั้งค่าเริ่มต้น
+async function addInitialSettings() {
+  try {
+    const countResult = await db.query('SELECT COUNT(*) as count FROM settings');
     
     if (parseInt(countResult.rows[0].count) === 0) {
-      console.log('กำลังเพิ่มการตั้งค่าเริ่มต้น...');
+      console.log('📝 กำลังเพิ่มการตั้งค่าเริ่มต้น...');
       
       const settings = [
         { name: 'organization_name', value: 'องค์การบริหารส่วนตำบลหัวนา', desc: 'ชื่อหน่วยงาน' },
@@ -160,115 +410,184 @@ async function addInitialSettings(client) {
         { name: 'admin_username', value: 'admin', desc: 'ชื่อผู้ใช้สำหรับแอดมิน' },
         { name: 'admin_password', value: 'admin123', desc: 'รหัสผ่านสำหรับแอดมิน' },
         { name: 'liff_id', value: '2001032478-VR5Akj0k', desc: 'LINE LIFF ID' },
-        { name: 'time_offset', value: '420', desc: 'ค่าชดเชยเวลา (นาที)' } // เพิ่มค่าชดเชยเวลาเป็นค่าเริ่มต้น
+        { name: 'time_offset', value: '420', desc: 'ค่าชดเชยเวลา (นาที)' },
+        { name: 'gas_web_app_url', value: 'https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec', desc: 'URL ของ Google Apps Script Web App' },
+        { name: 'use_gas_for_telegram', value: '1', desc: 'ใช้ Google Apps Script สำหรับส่งข้อความไป Telegram (1=ใช้, 0=ไม่ใช้)' },
+        { name: 'mobile_app_version', value: '1.0.0', desc: 'เวอร์ชันของ Mobile App' },
+        { name: 'enable_offline_mode', value: '1', desc: 'เปิดใช้งาน Offline Mode' },
+        { name: 'require_location', value: '1', desc: 'บังคับใช้ตำแหน่ง GPS' }
       ];
       
-      const insertQuery = 'INSERT INTO settings (setting_name, setting_value, description) VALUES ($1, $2, $3)';
-      
       for (const setting of settings) {
-        await getPool().query(insertQuery, [setting.name, setting.value, setting.desc]);
+        await db.query(
+          'INSERT INTO settings (setting_name, setting_value, description) VALUES ($1, $2, $3)',
+          [setting.name, setting.value, setting.desc]
+        );
       }
       
-      console.log('เพิ่มการตั้งค่าเริ่มต้นเรียบร้อยแล้ว');
+      console.log('✅ เพิ่มการตั้งค่าเริ่มต้นเรียบร้อยแล้ว');
+    } else {
+      // เพิ่ม settings ใหม่หากยังไม่มี
+      const newSettings = [
+        { name: 'mobile_app_version', value: '1.0.0', desc: 'เวอร์ชันของ Mobile App' },
+        { name: 'enable_offline_mode', value: '1', desc: 'เปิดใช้งาน Offline Mode' },
+        { name: 'require_location', value: '1', desc: 'บังคับใช้ตำแหน่ง GPS' }
+      ];
+      
+      for (const setting of newSettings) {
+        const checkResult = await db.query('SELECT setting_name FROM settings WHERE setting_name = $1', [setting.name]);
+        
+        if (checkResult.rows.length === 0) {
+          await db.query(
+            'INSERT INTO settings (setting_name, setting_value, description) VALUES ($1, $2, $3)',
+            [setting.name, setting.value, setting.desc]
+          );
+          console.log(`✅ เพิ่มการตั้งค่า ${setting.name} เรียบร้อยแล้ว`);
+        }
+      }
     }
   } catch (err) {
-    console.error('Error adding initial settings:', err.message);
+    console.error('❌ Error adding initial settings:', err.message);
+    throw err;
   }
 }
 
-// เพิ่มข้อมูลพนักงานตัวอย่าง
+// ⭐ เพิ่มข้อมูลพนักงานตัวอย่าง
 async function addSampleEmployees() {
   try {
-    // ตรวจสอบว่ามีข้อมูลในตาราง employees หรือไม่
-    const countResult = await getPool().query('SELECT COUNT(*) as count FROM employees');
+    const countResult = await db.query('SELECT COUNT(*) as count FROM employees');
     
     if (parseInt(countResult.rows[0].count) === 0) {
-      console.log('กำลังเพิ่มพนักงานตัวอย่าง...');
+      console.log('👥 กำลังเพิ่มพนักงานตัวอย่าง...');
       
       const employees = [
         { code: '001', name: 'สมชาย ใจดี', position: 'ผู้จัดการ', department: 'บริหาร' },
         { code: '002', name: 'สมหญิง รักเรียน', position: 'เจ้าหน้าที่', department: 'ธุรการ' }
       ];
       
-      const insertQuery = 'INSERT INTO employees (emp_code, full_name, position, department) VALUES ($1, $2, $3, $4)';
-      
       for (const emp of employees) {
-        await getPool().query(insertQuery, [emp.code, emp.name, emp.position, emp.department]);
+        await db.query(
+          'INSERT INTO employees (emp_code, full_name, position, department, mobile_enabled) VALUES ($1, $2, $3, $4, $5)',
+          [emp.code, emp.name, emp.position, emp.department, true]
+        );
       }
       
-      console.log('เพิ่มพนักงานตัวอย่างเรียบร้อยแล้ว');
+      console.log('✅ เพิ่มพนักงานตัวอย่างเรียบร้อยแล้ว');
     }
   } catch (err) {
-    console.error('Error adding sample employees:', err.message);
+    console.error('❌ Error adding sample employees:', err.message);
+    throw err;
   }
 }
 
-// Middleware
-app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-
-// จัดการเส้นทางสำหรับไฟล์สถิติก
-app.use(express.static(path.join(__dirname, 'public')));
-app.use('/admin', express.static(path.join(__dirname, 'public', 'admin')));
-
-// ตรวจสอบว่า log เข้าถึงทุก API
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} | ${req.method} ${req.url}`);
-  next();
-});
-
-// API - ดึงรายชื่อพนักงานสำหรับ autocomplete
-app.post('/api/getdata', async (req, res) => {
-  console.log('API: getdata - ดึงรายชื่อพนักงานสำหรับ autocomplete');
-  
-  try {
-    const result = await getPool().query('SELECT full_name FROM employees WHERE status = $1', ['active']);
-    const names = result.rows.map(e => e.full_name);
-    res.json(names);
-  } catch (err) {
-    console.error('Error in getdata:', err.message);
-    return res.json({ error: err.message });
-  }
-});
-
-// API - ดึงรายชื่อพนักงานทั้งหมด
-app.post('/api/getemployee', async (req, res) => {
-  console.log('API: getemployee - ดึงรายชื่อพนักงานทั้งหมด');
-  
-  try {
-    const result = await getPool().query('SELECT emp_code, full_name FROM employees WHERE status = $1', ['active']);
-    const data = result.rows.map(e => [e.full_name, e.emp_code]);
-    res.json(data);
-  } catch (err) {
-    console.error('Error in getemployee:', err.message);
-    return res.json({ error: err.message });
-  }
-});
-
-// ฟังก์ชันปรับเวลาที่ได้รับจากไคลเอ็นต์
+// ⭐ Helper Functions
 function adjustClientTime(clientTime) {
   try {
-    // แปลงเวลาจาก client เป็นวัตถุ Date
     const clientDate = new Date(clientTime);
-    
-    // ถ้าเวลาไม่ถูกต้อง ให้ใช้เวลาของเซิร์ฟเวอร์
     if (isNaN(clientDate.getTime())) {
       return new Date().toISOString();
     }
-    
-    // ไม่ต้องปรับเวลา เนื่องจากเราจะปรับที่การแสดงผลแทน
     return clientDate.toISOString();
   } catch (error) {
-    console.error('Error adjusting client time:', error);
-    // กรณีเกิดข้อผิดพลาด ให้ใช้เวลาของเซิร์ฟเวอร์
+    console.error('❌ Error adjusting client time:', error);
     return new Date().toISOString();
   }
 }
 
-// API - บันทึกเวลาเข้า
+function processAdminDateTime(timeString) {
+  if (!timeString) return null;
+  
+  console.log('🕐 Processing admin time input:', timeString);
+  
+  try {
+    let resultDate;
+    
+    // กรณี datetime-local จาก HTML input
+    if (timeString.includes('T') && timeString.length === 16) {
+      const fullDateTime = timeString + ':00';
+      resultDate = new Date(fullDateTime);
+      
+      if (isNaN(resultDate.getTime())) {
+        throw new Error('Invalid date object created');
+      }
+      
+      // แปลงเป็น UTC โดยลบ 7 ชั่วโมง
+      const utcDate = new Date(resultDate.getTime() - (7 * 60 * 60 * 1000));
+      return utcDate.toISOString();
+    }
+    
+    // กรณีที่มี timezone info แล้ว
+    if (timeString.includes('Z') || timeString.includes('+') || timeString.includes('-')) {
+      resultDate = new Date(timeString);
+      if (isNaN(resultDate.getTime())) {
+        throw new Error('Invalid date with timezone info');
+      }
+      return resultDate.toISOString();
+    }
+    
+    // กรณีอื่นๆ
+    resultDate = new Date(timeString);
+    if (isNaN(resultDate.getTime())) {
+      throw new Error('Cannot parse date string: ' + timeString);
+    }
+    
+    const utcDate = new Date(resultDate.getTime() - (7 * 60 * 60 * 1000));
+    return utcDate.toISOString();
+    
+  } catch (error) {
+    console.error('❌ Error processing time:', error.message);
+    const fallbackTime = new Date().toISOString();
+    console.log('🆘 Using fallback time (current time):', fallbackTime);
+    return fallbackTime;
+  }
+}
+
+function calculateDuration(startDate, endDate) {
+  const diff = Math.abs(endDate - startDate);
+  const hours = Math.floor(diff / (1000 * 60 * 60));
+  const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+  return `${hours} ชั่วโมง ${minutes} นาที`;
+}
+
+// ⭐ เรียกใช้ฟังก์ชันเตรียมฐานข้อมูล
+initializeDatabase().catch(error => {
+  console.error('❌ Failed to initialize database:', error);
+  process.exit(1);
+});
+
+// server.js - Mobile Time Tracker Server (ส่วนที่ 4/8)
+// Original API Routes (เดิม)
+
+// ⭐ API - ดึงรายชื่อพนักงานสำหรับ autocomplete (ใช้ cache)
+app.post('/api/getdata', async (req, res) => {
+  console.log('📋 API: getdata - ดึงรายชื่อพนักงานสำหรับ autocomplete');
+  
+  try {
+    const result = await db.executePrepared('GET_EMPLOYEE_NAMES', ['active']);
+    const names = result.rows.map(e => e.full_name);
+    res.json(names);
+  } catch (err) {
+    console.error('❌ Error in getdata:', err.message);
+    return res.json({ error: err.message });
+  }
+});
+
+// ⭐ API - ดึงรายชื่อพนักงานทั้งหมด (ใช้ cache)
+app.post('/api/getemployee', async (req, res) => {
+  console.log('👥 API: getemployee - ดึงรายชื่อพนักงานทั้งหมด');
+  
+  try {
+    const employees = await getEmployeesFromCache();
+    res.json(employees);
+  } catch (err) {
+    console.error('❌ Error in getemployee:', err.message);
+    return res.json({ error: err.message });
+  }
+});
+
+// ⭐ API - บันทึกเวลาเข้า (ปรับปรุงประสิทธิภาพ)
 app.post('/api/clockin', async (req, res) => {
-  console.log('API: clockin - บันทึกเวลาเข้า', req.body);
+  console.log('⏰ API: clockin - บันทึกเวลาเข้า', req.body);
   
   try {
     const { 
@@ -281,27 +600,22 @@ app.post('/api/clockin', async (req, res) => {
       client_time 
     } = req.body;
     
-    // ตรวจสอบว่ามีชื่อพนักงาน
     if (!employee) {
       return res.json({ msg: 'กรุณาระบุชื่อพนักงาน' });
     }
     
-    // ค้นหาพนักงานจากชื่อหรือรหัส
-    const empResult = await getPool().query('SELECT id FROM employees WHERE emp_code = $1 OR full_name = $1', [employee]);
+    // ใช้ prepared statement
+    const empResult = await db.executePrepared('GET_EMPLOYEE_BY_CODE', [employee]);
     
     if (empResult.rows.length === 0) {
       return res.json({ msg: 'ไม่พบข้อมูลพนักงาน' });
     }
     
     const emp = empResult.rows[0];
-    
-    // ตรวจสอบว่าลงเวลาเข้าซ้ำหรือไม่
     const today = new Date().toISOString().split('T')[0];
     
-    const checkExistingResult = await getPool().query(
-      'SELECT id FROM time_logs WHERE employee_id = $1 AND DATE(clock_in) = $2',
-      [emp.id, today]
-    );
+    // ตรวจสอบการลงเวลาซ้ำ
+    const checkExistingResult = await db.executePrepared('CHECK_CLOCK_IN_TODAY', [emp.id, today]);
     
     if (checkExistingResult.rows.length > 0) {
       return res.json({ 
@@ -310,71 +624,44 @@ app.post('/api/clockin', async (req, res) => {
       });
     }
     
-    // ใช้เวลาจาก client หากส่งมา มิฉะนั้นใช้เวลาของเซิร์ฟเวอร์
     const now = client_time ? adjustClientTime(client_time) : new Date().toISOString();
     
     // บันทึกเวลาเข้า
-    await getPool().query(
-      `INSERT INTO time_logs 
-      (employee_id, clock_in, note, latitude_in, longitude_in, line_name, line_picture)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [emp.id, now, userinfo || null, lat || null, lon || null, line_name || null, line_picture || null]
-    );
+    await db.executePrepared('INSERT_TIME_LOG', [
+      emp.id, now, userinfo || null, lat || null, lon || null, line_name || null, line_picture || null
+    ]);
     
-    // ดึง token สำหรับส่งแจ้งเตือน
-    const notifySettingResult = await getPool().query(
-      'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['notify_clock_in']
-    );
-
-    // สร้างข้อความสำหรับส่งแจ้งเตือน
-    const date = new Date(now);
-    const thaiFormatter = new Intl.DateTimeFormat('th-TH', {
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-      weekday: 'long'
+    // ส่งแจ้งเตือน (ไม่รอผลลัพธ์)
+    setImmediate(async () => {
+      try {
+        await sendNotification('clock_in', employee, now, userinfo, lat, lon, line_name);
+      } catch (error) {
+        console.error('❌ Notification error:', error);
+      }
     });
-    const thaiDate = thaiFormatter.format(date);
-
+    
+    // ปรับเวลาเป็นเวลาไทย
+    const date = new Date(now);
     const hours = String(date.getUTCHours() + 7).padStart(2, '0');
     const minutes = String(date.getUTCMinutes()).padStart(2, '0');
     const seconds = String(date.getUTCSeconds()).padStart(2, '0');
     const returnDate = `${hours}:${minutes}:${seconds}`;
-
-    // สถานที่หรือที่อยู่ (ถ้ามีระบบเพิ่มเติมที่ระบุชื่อสถานที่จากพิกัด)
-    const location = lat && lon ? `${lat}, ${lon}` : "ไม่มีข้อมูล";
-
-    let message =
-      `⏱ ลงเวลาเข้างาน\n` +
-      `👤 ชื่อ-นามสกุล: *${employee}*\n` +
-      `📅 วันที่: *${thaiDate}*\n` +
-      `🕒 เวลา: *${returnDate}*\n` +
-      (line_name ? `💬 ชื่อไลน์: *${line_name}*\n` : "") +
-      (userinfo ? `📝 หมายเหตุ: *${userinfo}*\n` : "") +
-      (lat && lon ? `📍 พิกัด: *${location}*\n` +
-      `🗺 แผนที่: [ดูแผนที่](https://www.google.com/maps/place/${lat},${lon})` : "📍 พิกัด: *ไม่มีข้อมูล*");
-
-    // ส่งการแจ้งเตือนถ้าตั้งค่าไว้
-    if (notifySettingResult.rows.length > 0 && notifySettingResult.rows[0].setting_value === '1') {
-      await sendTelegramToAllGroups(message, lat, lon, employee);
-    }
     
     return res.json({
       msg: 'SUCCESS',
       employee,
       return_date: returnDate,
-      return_date_utc: now // เพิ่มวันที่ในรูปแบบ UTC เพื่อให้ client สามารถแปลงได้
+      return_date_utc: now
     });
   } catch (error) {
-    console.error('Error in clockin:', error);
+    console.error('❌ Error in clockin:', error);
     return res.json({ msg: 'เกิดข้อผิดพลาด: ' + error.message });
   }
 });
 
-// API - บันทึกเวลาออก
+// ⭐ API - บันทึกเวลาออก (ปรับปรุงประสิทธิภาพ)
 app.post('/api/clockout', async (req, res) => {
-  console.log('API: clockout - บันทึกเวลาออก', req.body);
+  console.log('🏃 API: clockout - บันทึกเวลาออก', req.body);
   
   try {
     const { 
@@ -386,30 +673,20 @@ app.post('/api/clockout', async (req, res) => {
       client_time 
     } = req.body;
     
-    // ตรวจสอบว่ามีชื่อพนักงาน
     if (!employee) {
       return res.json({ msg: 'กรุณาระบุชื่อพนักงาน' });
     }
     
-    // ค้นหาพนักงานจากชื่อหรือรหัส
-    const empResult = await getPool().query(
-      'SELECT id FROM employees WHERE emp_code = $1 OR full_name = $1',
-      [employee]
-    );
+    const empResult = await db.executePrepared('GET_EMPLOYEE_BY_CODE', [employee]);
     
     if (empResult.rows.length === 0) {
       return res.json({ msg: 'ไม่พบข้อมูลพนักงาน' });
     }
     
     const emp = empResult.rows[0];
-    
-    // ตรวจสอบว่าลงเวลาเข้าวันนี้หรือไม่
     const today = new Date().toISOString().split('T')[0];
     
-    const recordResult = await getPool().query(
-      'SELECT id, clock_out FROM time_logs WHERE employee_id = $1 AND DATE(clock_in) = $2 ORDER BY clock_in DESC LIMIT 1',
-      [emp.id, today]
-    );
+    const recordResult = await db.executePrepared('GET_TODAY_RECORD', [emp.id, today]);
     
     if (recordResult.rows.length === 0) {
       return res.json({ 
@@ -427,70 +704,43 @@ app.post('/api/clockout', async (req, res) => {
       });
     }
     
-    // ใช้เวลาจาก client หากส่งมา มิฉะนั้นใช้เวลาของเซิร์ฟเวอร์
     const now = client_time ? adjustClientTime(client_time) : new Date().toISOString();
     
     // บันทึกเวลาออก
-    await getPool().query(
-      `UPDATE time_logs SET 
-      clock_out = $1, latitude_out = $2, longitude_out = $3, line_name = $4, line_picture = $5
-      WHERE id = $6`,
-      [now, lat || null, lon || null, line_name || null, line_picture || null, record.id]
-    );
+    await db.executePrepared('UPDATE_CLOCK_OUT', [
+      now, lat || null, lon || null, line_name || null, line_picture || null, record.id
+    ]);
     
-    // ดึง token สำหรับส่งแจ้งเตือน
-    const notifySettingResult = await getPool().query(
-      'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['notify_clock_out']
-    );
-
-    // สร้างข้อความสำหรับส่งแจ้งเตือน
-    const date = new Date(now);
-    const thaiFormatter = new Intl.DateTimeFormat('th-TH', {
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-      weekday: 'long'
+    // ส่งแจ้งเตือน (ไม่รอผลลัพธ์)
+    setImmediate(async () => {
+      try {
+        await sendNotification('clock_out', employee, now, null, lat, lon, line_name);
+      } catch (error) {
+        console.error('❌ Notification error:', error);
+      }
     });
-    const thaiDate = thaiFormatter.format(date);
-
+    
+    const date = new Date(now);
     const hours = String(date.getUTCHours() + 7).padStart(2, '0');
     const minutes = String(date.getUTCMinutes()).padStart(2, '0');
     const seconds = String(date.getUTCSeconds()).padStart(2, '0');
     const returnDate = `${hours}:${minutes}:${seconds}`;
-
-    // สถานที่หรือที่อยู่
-    const location = lat && lon ? `${lat}, ${lon}` : "ไม่มีข้อมูล";
-
-    let message =
-      `⏱ ลงเวลาออกงาน\n` +
-      `👤 ชื่อ-นามสกุล: *${employee}*\n` +
-      `📅 วันที่: *${thaiDate}*\n` +
-      `🕒 เวลา: *${returnDate}*\n` +
-      (line_name ? `💬 ชื่อไลน์: *${line_name}*\n` : "") +
-      (lat && lon ? `📍 พิกัด: *${location}*\n` +
-      `🗺 แผนที่: [ดูแผนที่](https://www.google.com/maps/place/${lat},${lon})` : "📍 พิกัด: *ไม่มีข้อมูล*");
-
-    // ส่งการแจ้งเตือนถ้าตั้งค่าไว้
-    if (notifySettingResult.rows.length > 0 && notifySettingResult.rows[0].setting_value === '1') {
-      await sendTelegramToAllGroups(message, lat, lon, employee);
-    }
     
     return res.json({
       msg: 'SUCCESS',
       employee,
       return_date: returnDate,
-      return_date_utc: now // เพิ่มวันที่ในรูปแบบ UTC เพื่อให้ client สามารถแปลงได้
+      return_date_utc: now
     });
   } catch (error) {
-    console.error('Error in clockout:', error);
+    console.error('❌ Error in clockout:', error);
     return res.json({ msg: 'เกิดข้อผิดพลาด: ' + error.message });
   }
 });
 
 // API - ส่งแจ้งเตือน Telegram
 app.post('/api/sendnotify', async (req, res) => {
-  console.log('API: sendnotify - ส่งแจ้งเตือน Telegram', req.body);
+  console.log('📢 API: sendnotify - ส่งแจ้งเตือน Telegram', req.body);
   
   try {
     const { message, token, chat_id, lat, lon } = req.body;
@@ -499,10 +749,8 @@ app.post('/api/sendnotify', async (req, res) => {
       return res.json({ success: false, msg: 'ข้อมูลไม่ครบถ้วน' });
     }
     
-    // เตรียมข้อความ
     let notifyMessage = message;
     
-    // เพิ่มลิงก์แผนที่ถ้ามีพิกัด
     if (lat && lon) {
       notifyMessage += `\nพิกัด: https://www.google.com/maps?q=${lat},${lon}`;
     }
@@ -510,13 +758,13 @@ app.post('/api/sendnotify', async (req, res) => {
     console.log('Sending Telegram message:', notifyMessage);
     
     try {
-      // ส่งแจ้งเตือนไปยัง Telegram Bot API
       const response = await axios.post(
         `https://api.telegram.org/bot${token}/sendMessage`,
         {
           chat_id: chat_id,
           text: notifyMessage
-        }
+        },
+        { timeout: 10000 }
       );
       
       console.log('Telegram response:', response.data);
@@ -531,98 +779,53 @@ app.post('/api/sendnotify', async (req, res) => {
   }
 });
 
-// ฟังก์ชัน sendTelegramToAllGroups ให้ส่งข้อมูลไปยัง GSA 
-async function sendTelegramToAllGroups(message, lat, lon, employee) {
+// API - ดึง LIFF ID
+app.get('/api/getLiffId', async (req, res) => {
+  console.log('API: getLiffId - ดึง LIFF ID');
+  
   try {
-    // ดึง token และ URL ของ GSA
-    const tokenResult = await getPool().query(
+    const result = await db.query(
       'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['telegram_bot_token']
-    );
-
-    const gasUrlResult = await getPool().query(
-      'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['gas_web_app_url']
+      ['liff_id']
     );
     
-    // ถ้าไม่มี URL ของ GSA ในฐานข้อมูล ให้ใช้ค่าเริ่มต้น
-    let gasUrl = 'https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec';
-    
-    if (gasUrlResult.rows.length > 0 && gasUrlResult.rows[0].setting_value) {
-      gasUrl = gasUrlResult.rows[0].setting_value.trim(); // เพิ่ม .trim() เพื่อตัดช่องว่าง
+    if (result.rows.length > 0) {
+      return res.json({ success: true, liffId: result.rows[0].setting_value });
     } else {
-      console.log('ไม่พบ URL ของ GSA ในฐานข้อมูล ใช้ค่าเริ่มต้น');
-    }
-    
-    if (tokenResult.rows.length === 0 || !tokenResult.rows[0].setting_value) {
-      console.error('Error getting Telegram token or token not set');
-      return;
-    }
-    
-    const token = tokenResult.rows[0].setting_value;
-    
-    // ดึงข้อมูลกลุ่ม
-    const groupsResult = await getPool().query(
-      'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['telegram_groups']
-    );
-    
-    if (groupsResult.rows.length === 0 || !groupsResult.rows[0].setting_value) {
-      console.error('No Telegram groups configured');
-      return;
-    }
-    
-    try {
-      const groups = JSON.parse(groupsResult.rows[0].setting_value);
-      
-      // ส่งข้อความไปยังแต่ละกลุ่มที่เปิดใช้งานผ่าน GSA
-      for (const group of groups) {
-        if (group.active && group.chat_id) {
-          try {
-            console.log(`Sending message to ${group.name} (${group.chat_id}) via GSA`);
-            
-            // สร้าง JSON string สำหรับข้อมูลที่ต้องการส่ง
-            const jsonData = {
-              message: message,
-              chatId: group.chat_id,
-              token: token
-            };
-            
-            // เพิ่มพิกัดถ้ามี
-            if (lat && lon) {
-              jsonData.lat = lat;
-              jsonData.lon = lon;
-            }
-            
-            // แปลง JSON เป็น URL-encoded string
-            const encodedData = encodeURIComponent(JSON.stringify(jsonData));
-            
-            // สร้าง URL พร้อมพารามิเตอร์
-            const urlWithParams = `${gasUrl}?opt=sendToTelegram&data=${encodedData}`;
-            
-            console.log('Sending request to GSA:', urlWithParams);
-            
-            // ใช้ axios.get แบบตรงๆ โดยส่ง URL ที่มีพารามิเตอร์แล้ว
-            const response = await axios.get(urlWithParams);
-            
-            console.log(`Message sent to ${group.name} via GSA successfully:`, response.data);
-          } catch (error) {
-            console.error(`Error sending message to ${group.name} via GSA:`, error.message);
-            console.error('Error details:', error.response?.data || error);
-          }
-        }
-      }
-    } catch (error) {
-      console.error('Error parsing Telegram groups:', error.message);
+      // ถ้าไม่พบ LIFF ID ในฐานข้อมูล ให้ใช้ค่าเริ่มต้น
+      return res.json({ success: true, liffId: '2001032478-VR5Akj0k' });
     }
   } catch (error) {
-    console.error('Error in sendTelegramToAllGroups:', error.message);
+    console.error('Error getting LIFF ID:', error);
+    return res.json({ success: false, error: error.message });
   }
-}
+});
 
-// เพิ่ม API endpoint สำหรับตั้งค่า URL ของ Google Apps Script
+// เพิ่ม API สำหรับดึงค่าชดเชยเวลา
+app.get('/api/getTimeOffset', async (req, res) => {
+  console.log('API: getTimeOffset - ดึงค่าชดเชยเวลา');
+  
+  try {
+    const result = await db.query(
+      'SELECT setting_value FROM settings WHERE setting_name = $1',
+      ['time_offset']
+    );
+    
+    if (result.rows.length > 0) {
+      return res.json({ success: true, time_offset: result.rows[0].setting_value });
+    } else {
+      // ถ้าไม่พบค่าชดเชยเวลาในฐานข้อมูล ให้ใช้ค่าเริ่มต้น
+      return res.json({ success: true, time_offset: 420 }); // ตั้งค่าเริ่มต้นเป็น 7 ชั่วโมง (420 นาที)
+    }
+  } catch (error) {
+    console.error('Error getting time offset:', error);
+    return res.json({ success: false, error: error.message });
+  }
+});
+
+// API สำหรับตั้งค่า URL ของ Google Apps Script
 app.post('/api/admin/set-gas-url', async (req, res) => {
-  console.log('API: admin/set-gas-url - ตั้งค่า URL ของ GSA', req.body);
+  console.log('🔧 API: admin/set-gas-url - ตั้งค่า URL ของ GSA', req.body);
   
   try {
     const { gas_url } = req.body;
@@ -631,8 +834,7 @@ app.post('/api/admin/set-gas-url', async (req, res) => {
       return res.json({ success: false, message: 'กรุณาระบุ URL' });
     }
     
-    // บันทึก URL ลงฐานข้อมูล
-    await getPool().query(
+    await db.query(
       'INSERT INTO settings (setting_name, setting_value, description) VALUES ($1, $2, $3) ON CONFLICT (setting_name) DO UPDATE SET setting_value = $2',
       ['gas_web_app_url', gas_url, 'URL ของ Google Apps Script Web App']
     );
@@ -647,7 +849,7 @@ app.post('/api/admin/set-gas-url', async (req, res) => {
 
 // API - ทดสอบการส่งข้อความผ่าน GSA
 app.post('/api/admin/test-gas', async (req, res) => {
-  console.log('API: admin/test-gas - ทดสอบการส่งข้อความผ่าน GSA', req.body);
+  console.log('🧪 API: admin/test-gas - ทดสอบการส่งข้อความผ่าน GSA', req.body);
   
   try {
     const { message, lat, lon, gasUrl } = req.body;
@@ -656,12 +858,10 @@ app.post('/api/admin/test-gas', async (req, res) => {
       return res.json({ success: false, message: 'กรุณาระบุข้อความ' });
     }
     
-    // ใช้ URL ที่ส่งมาจากฟอร์มถ้ามี ถ้าไม่มีให้ดึงจากฐานข้อมูล
     let useGasUrl = gasUrl;
     
     if (!useGasUrl) {
-      // ดึง URL ของ GSA จากฐานข้อมูล
-      const gasUrlResult = await getPool().query(
+      const gasUrlResult = await db.query(
         'SELECT setting_value FROM settings WHERE setting_name = $1',
         ['gas_web_app_url']
       );
@@ -672,39 +872,29 @@ app.post('/api/admin/test-gas', async (req, res) => {
       
       useGasUrl = gasUrlResult.rows[0].setting_value.trim();
     } else {
-      // ตัดช่องว่างออก
       useGasUrl = useGasUrl.trim();
     }
     
-    // ตรวจสอบว่า URL มีรูปแบบถูกต้องหรือไม่
     if (!useGasUrl.startsWith('https://')) {
       return res.json({ success: false, message: 'URL ของ GSA ต้องขึ้นต้นด้วย https://' });
     }
     
     console.log('ใช้ URL GSA สำหรับทดสอบ:', useGasUrl);
     
-    // ดึง token และ chat_id
-    const tokenResult = await getPool().query(
-      'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['telegram_bot_token']
-    );
+    const [tokenResult, groupsResult] = await Promise.all([
+      db.query('SELECT setting_value FROM settings WHERE setting_name = $1', ['telegram_bot_token']),
+      db.query('SELECT setting_value FROM settings WHERE setting_name = $1', ['telegram_groups'])
+    ]);
     
     if (tokenResult.rows.length === 0 || !tokenResult.rows[0].setting_value) {
       return res.json({ success: false, message: 'ไม่พบ Token ของ Telegram กรุณาตั้งค่าก่อน' });
     }
     
-    const token = tokenResult.rows[0].setting_value;
-    
-    // ดึงข้อมูลกลุ่มแรกที่เปิดใช้งาน
-    const groupsResult = await getPool().query(
-      'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['telegram_groups']
-    );
-    
     if (groupsResult.rows.length === 0 || !groupsResult.rows[0].setting_value) {
       return res.json({ success: false, message: 'ไม่พบข้อมูลกลุ่ม Telegram กรุณาตั้งค่าก่อน' });
     }
     
+    const token = tokenResult.rows[0].setting_value;
     const groups = JSON.parse(groupsResult.rows[0].setting_value);
     const activeGroup = groups.find(g => g.active && g.chat_id);
     
@@ -712,14 +902,12 @@ app.post('/api/admin/test-gas', async (req, res) => {
       return res.json({ success: false, message: 'ไม่พบกลุ่ม Telegram ที่เปิดใช้งาน' });
     }
     
-    // ข้อมูลสำหรับส่งไปยัง GSA
     const jsonData = {
       message: message,
       chatId: activeGroup.chat_id,
       token: token
     };
     
-    // เพิ่มพิกัดถ้ามี
     if (lat && lon) {
       jsonData.lat = lat;
       jsonData.lon = lon;
@@ -727,14 +915,12 @@ app.post('/api/admin/test-gas', async (req, res) => {
     
     console.log('ข้อมูลที่ส่งไป GSA:', JSON.stringify(jsonData));
     
-    // แปลง JSON เป็น URL-encoded string และสร้าง URL พร้อมพารามิเตอร์
     const encodedData = encodeURIComponent(JSON.stringify(jsonData));
     const urlWithParams = `${useGasUrl}?opt=sendToTelegram&data=${encodedData}`;
     
     console.log('URL ที่เรียก:', urlWithParams);
     
-    // ส่งข้อมูลไปยัง GSA ด้วย axios.get
-    const response = await axios.get(urlWithParams);
+    const response = await axios.get(urlWithParams, { timeout: 15000 });
     
     console.log('การตอบกลับจาก GSA:', response.data);
     res.json({ 
@@ -753,165 +939,14 @@ app.post('/api/admin/test-gas', async (req, res) => {
   }
 });
 
-// ปรับปรุงฟังก์ชัน initializeDatabase เพื่อเพิ่ม setting สำหรับ GAS URL
-async function initializeDatabase() {
-  console.log('กำลังตรวจสอบและสร้างตาราง...');
-  
-  const client = await pool.connect();
-  
-  try {
-    // เริ่ม transaction
-    await client.query('BEGIN');
-    
-    // (ส่วนโค้ดอื่นๆ ยังคงเหมือนเดิม)
-    // สร้างตารางเก็บรายชื่อพนักงาน
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS employees (
-        id SERIAL PRIMARY KEY,
-        emp_code TEXT NOT NULL UNIQUE,
-        full_name TEXT NOT NULL,
-        position TEXT,
-        department TEXT,
-        line_id TEXT,
-        line_name TEXT,
-        line_picture TEXT,
-        status TEXT DEFAULT 'active',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-    console.log('ตาราง employees สร้างหรือมีอยู่แล้ว');
-
-    // สร้างตารางเก็บบันทึกเวลา
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS time_logs (
-        id SERIAL PRIMARY KEY,
-        employee_id INTEGER NOT NULL,
-        clock_in TIMESTAMP,
-        clock_out TIMESTAMP,
-        note TEXT,
-        latitude_in REAL,
-        longitude_in REAL,
-        latitude_out REAL,
-        longitude_out REAL,
-        line_id TEXT,
-        line_name TEXT,
-        line_picture TEXT,
-        status TEXT DEFAULT 'normal',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (employee_id) REFERENCES employees(id)
-      )
-    `);
-    console.log('ตาราง time_logs สร้างหรือมีอยู่แล้ว');
-
-    // สร้างตารางเก็บค่า settings
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS settings (
-        id SERIAL PRIMARY KEY,
-        setting_name TEXT NOT NULL UNIQUE,
-        setting_value TEXT,
-        description TEXT
-      )
-    `);
-    console.log('ตาราง settings สร้างหรือมีอยู่แล้ว');
-    
-    // Commit transaction
-    await client.query('COMMIT');
-    
-    // ตรวจสอบและเพิ่มข้อมูลเริ่มต้น
-    await addInitialSettings(client);
-    await addSampleEmployees(client);
-    
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Error initializing database:', err.message);
-  } finally {
-    client.release();
-  }
-}
-
-// ปรับปรุงฟังก์ชัน addInitialSettings เพื่อเพิ่ม setting สำหรับ GAS URL
-async function addInitialSettings(client) {
-  try {
-    // ตรวจสอบว่ามีข้อมูลในตาราง settings หรือไม่
-    const countResult = await getPool().query('SELECT COUNT(*) as count FROM settings');
-    
-    if (parseInt(countResult.rows[0].count) === 0) {
-      console.log('กำลังเพิ่มการตั้งค่าเริ่มต้น...');
-      
-      const settings = [
-        { name: 'organization_name', value: 'องค์การบริหารส่วนตำบลหัวนา', desc: 'ชื่อหน่วยงาน' },
-        { name: 'work_start_time', value: '08:30', desc: 'เวลาเริ่มงาน' },
-        { name: 'work_end_time', value: '16:30', desc: 'เวลาเลิกงาน' },
-        { name: 'allowed_ip', value: '', desc: 'IP Address ที่อนุญาต' },
-        { name: 'telegram_bot_token', value: '', desc: 'Token สำหรับ Telegram Bot' },
-        { name: 'telegram_groups', value: '[{"name":"กลุ่มหลัก","chat_id":"","active":true}]', desc: 'กลุ่มรับการแจ้งเตือน Telegram' },
-        { name: 'notify_clock_in', value: '1', desc: 'แจ้งเตือนเมื่อลงเวลาเข้า' },
-        { name: 'notify_clock_out', value: '1', desc: 'แจ้งเตือนเมื่อลงเวลาออก' },
-        { name: 'admin_username', value: 'admin', desc: 'ชื่อผู้ใช้สำหรับแอดมิน' },
-        { name: 'admin_password', value: 'admin123', desc: 'รหัสผ่านสำหรับแอดมิน' },
-        { name: 'liff_id', value: '2001032478-VR5Akj0k', desc: 'LINE LIFF ID' },
-        { name: 'time_offset', value: '420', desc: 'ค่าชดเชยเวลา (นาที)' },
-        // เพิ่ม setting สำหรับ GAS URL
-        { name: 'gas_web_app_url', value: 'https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec', desc: 'URL ของ Google Apps Script Web App' },
-        // เพิ่ม setting สำหรับเลือกใช้ GSA แทน Telegram API โดยตรง
-        { name: 'use_gas_for_telegram', value: '1', desc: 'ใช้ Google Apps Script สำหรับส่งข้อความไป Telegram (1=ใช้, 0=ไม่ใช้)' }
-      ];
-      
-      const insertQuery = 'INSERT INTO settings (setting_name, setting_value, description) VALUES ($1, $2, $3)';
-      
-      for (const setting of settings) {
-        await getPool().query(insertQuery, [setting.name, setting.value, setting.desc]);
-      }
-      
-      console.log('เพิ่มการตั้งค่าเริ่มต้นเรียบร้อยแล้ว');
-    } else {
-      // ตรวจสอบและเพิ่ม setting ใหม่หากยังไม่มี
-      const newSettings = [
-        { name: 'gas_web_app_url', value: 'https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec', desc: 'URL ของ Google Apps Script Web App' },
-        { name: 'use_gas_for_telegram', value: '1', desc: 'ใช้ Google Apps Script สำหรับส่งข้อความไป Telegram (1=ใช้, 0=ไม่ใช้)' }
-      ];
-      
-      for (const setting of newSettings) {
-        const checkResult = await getPool().query('SELECT setting_name FROM settings WHERE setting_name = $1', [setting.name]);
-        
-        if (checkResult.rows.length === 0) {
-          await getPool().query(
-            'INSERT INTO settings (setting_name, setting_value, description) VALUES ($1, $2, $3)',
-            [setting.name, setting.value, setting.desc]
-          );
-          console.log(`เพิ่มการตั้งค่า ${setting.name} เรียบร้อยแล้ว`);
-        }
-      }
-    }
-  } catch (err) {
-    console.error('Error adding initial settings:', err.message);
-  }
-}
-
-// ตรวจสอบการตั้งค่าว่าใช้ GSA หรือไม่
-async function isUsingGasForTelegram() {
-  try {
-    const result = await getPool().query(
-      'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['use_gas_for_telegram']
-    );
-    
-    if (result.rows.length > 0) {
-      return result.rows[0].setting_value === '1';
-    }
-    
-    return true; // ค่าเริ่มต้นคือใช้ GSA
-  } catch (error) {
-    console.error('Error checking if using GAS for Telegram:', error.message);
-    return true; // กรณีเกิดข้อผิดพลาด ให้ใช้ GSA
-  }
-}
+// server.js - Mobile Time Tracker Server (ส่วนที่ 5/8)
+// Admin API Routes (เดิม)
 
 // --- API สำหรับระบบแอดมิน ---
 
 // ตรวจสอบการเข้าสู่ระบบแอดมิน
 app.post('/api/admin/login', async (req, res) => {
-  console.log('API: admin/login - ตรวจสอบการเข้าสู่ระบบแอดมิน', req.body);
+  console.log('🔐 API: admin/login - ตรวจสอบการเข้าสู่ระบบแอดมิน', req.body);
   
   try {
     const { username, password } = req.body;
@@ -924,34 +959,22 @@ app.post('/api/admin/login', async (req, res) => {
     
     // ตรวจสอบด้วยค่าเริ่มต้น admin/admin123 ก่อน
     if (username === 'admin' && password === 'admin123') {
-    //const adminUsername = process.env.ADMIN_USERNAME || 'admin';
-    //const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
-
-    //if (username === adminUsername && password === adminPassword) {
       console.log('Admin login successful with default credentials');
       return res.json({ success: true });
     }
     
     // ตรวจสอบกับข้อมูลในฐานข้อมูล
-    const adminUserResult = await getPool().query(
-      'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['admin_username']
-    );
+    const [adminUserResult, adminPassResult] = await Promise.all([
+      db.query('SELECT setting_value FROM settings WHERE setting_name = $1', ['admin_username']),
+      db.query('SELECT setting_value FROM settings WHERE setting_name = $1', ['admin_password'])
+    ]);
     
-    if (adminUserResult.rows.length === 0) {
+    if (adminUserResult.rows.length === 0 || adminPassResult.rows.length === 0) {
       return res.json({ success: false, message: 'ไม่พบข้อมูลผู้ดูแลระบบ' });
     }
     
-    const adminPassResult = await getPool().query(
-      'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['admin_password']
-    );
-    
-    if (adminPassResult.rows.length === 0) {
-      return res.json({ success: false, message: 'ไม่พบข้อมูลผู้ดูแลระบบ' });
-    }
-    
-    if (username === adminUserResult.rows[0].setting_value && password === adminPassResult.rows[0].setting_value) {
+    if (username === adminUserResult.rows[0].setting_value && 
+        password === adminPassResult.rows[0].setting_value) {
       console.log('Admin login successful with database credentials');
       return res.json({ success: true });
     }
@@ -964,12 +987,12 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-// API - ดึงข้อมูลการลงเวลาทั้งหมด
+// ⭐ API - ดึงข้อมูลการลงเวลาทั้งหมด (ปรับปรุงประสิทธิภาพ)
 app.get('/api/admin/time-logs', async (req, res) => {
-  console.log('API: admin/time-logs - ดึงข้อมูลการลงเวลาทั้งหมด', req.query);
+  console.log('📊 API: admin/time-logs - ดึงข้อมูลการลงเวลาทั้งหมด', req.query);
   
   try {
-    const { from_date, to_date, employee_id } = req.query;
+    const { from_date, to_date, employee_id, limit = 100, offset = 0 } = req.query;
     
     let query = `
       SELECT t.id, e.emp_code, e.full_name, e.position, e.department, 
@@ -998,17 +1021,17 @@ app.get('/api/admin/time-logs', async (req, res) => {
       params.push(employee_id);
     }
     
-    query += ' ORDER BY t.clock_in DESC';
+    query += ` ORDER BY t.clock_in DESC LIMIT $${paramIndex++} OFFSET $${paramIndex++}`;
+    params.push(limit, offset);
     
     console.log('Running query:', query, 'with params:', params);
     
-    const result = await getPool().query(query, params);
+    const result = await db.query(query, params);
     
     console.log(`Found ${result.rows.length} time logs`);
     
-    // ปรับรูปแบบวันที่เวลาให้อ่านง่าย และตรวจสอบค่า null
+    // ปรับรูปแบบวันที่เวลาให้อ่านง่าย
     const formattedLogs = result.rows.filter(log => log && log.clock_in).map(log => {
-      // ปรับเวลาให้เป็นเวลาไทย
       const clockInDate = new Date(new Date(log.clock_in).getTime() + (7 * 60 * 60 * 1000));
       const clockOutDate = log.clock_out ? new Date(new Date(log.clock_out).getTime() + (7 * 60 * 60 * 1000)) : null;
       
@@ -1029,91 +1052,20 @@ app.get('/api/admin/time-logs', async (req, res) => {
   }
 });
 
-// คำนวณระยะเวลาทำงาน
-function calculateDuration(startDate, endDate) {
-  const diff = Math.abs(endDate - startDate);
-  const hours = Math.floor(diff / (1000 * 60 * 60));
-  const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-  
-  return `${hours} ชั่วโมง ${minutes} นาที`;
-}
-
-function processAdminDateTime(timeString) {
-  if (!timeString) return null;
-  
-  console.log('🕐 Processing admin time input:', timeString);
-  
-  try {
-    let resultDate;
-    
-    // กรณี datetime-local จาก HTML input (YYYY-MM-DDTHH:MM)
-    if (timeString.includes('T') && timeString.length === 16) {
-      // เพิ่ม :00 สำหรับวินาที
-      const fullDateTime = timeString + ':00';
-      console.log('📝 Full datetime string:', fullDateTime);
-      
-      // สร้าง Date object โดยถือว่าเป็นเวลาท้องถิ่น
-      resultDate = new Date(fullDateTime);
-      
-      // ตรวจสอบว่า Date object ถูกต้องหรือไม่
-      if (isNaN(resultDate.getTime())) {
-        throw new Error('Invalid date object created');
-      }
-      
-      console.log('📅 Local date object:', resultDate.toString());
-      console.log('🌍 Local time (Thai assumed):', resultDate.toLocaleString('th-TH'));
-      
-      // แปลงเป็น UTC โดยลบ 7 ชั่วโมง
-      const utcDate = new Date(resultDate.getTime() - (7 * 60 * 60 * 1000));
-      console.log('🌐 UTC date object:', utcDate.toString());
-      console.log('📤 Final UTC ISO:', utcDate.toISOString());
-      
-      return utcDate.toISOString();
-    }
-    
-    // กรณีที่มี timezone info แล้ว
-    if (timeString.includes('Z') || timeString.includes('+') || timeString.includes('-')) {
-      resultDate = new Date(timeString);
-      if (isNaN(resultDate.getTime())) {
-        throw new Error('Invalid date with timezone info');
-      }
-      console.log('✅ Already has timezone info, using as-is:', resultDate.toISOString());
-      return resultDate.toISOString();
-    }
-    
-    // กรณีอื่นๆ - ลองแปลงโดยตรง
-    resultDate = new Date(timeString);
-    if (isNaN(resultDate.getTime())) {
-      throw new Error('Cannot parse date string: ' + timeString);
-    }
-    
-    // สมมติว่าเป็นเวลาไทยและแปลงเป็น UTC
-    const utcDate = new Date(resultDate.getTime() - (7 * 60 * 60 * 1000));
-    console.log('🔄 General conversion to UTC:', utcDate.toISOString());
-    return utcDate.toISOString();
-    
-  } catch (error) {
-    console.error('❌ Error processing time:', error.message);
-    console.error('📋 Input was:', timeString);
-    
-    // Fallback: ใช้เวลาปัจจุบัน
-    const fallbackTime = new Date().toISOString();
-    console.log('🆘 Using fallback time (current time):', fallbackTime);
-    return fallbackTime;
-  }
-}
-
-// API - ดึงข้อมูลพนักงานทั้งหมด
+// ⭐ API - ดึงข้อมูลพนักงานทั้งหมด (ปรับปรุงประสิทธิภาพ)
 app.get('/api/admin/employees', async (req, res) => {
-  console.log('API: admin/employees - ดึงข้อมูลพนักงานทั้งหมด');
+  console.log('👥 API: admin/employees - ดึงข้อมูลพนักงานทั้งหมด');
   
   try {
-    const result = await getPool().query(`
+    const { limit = 100, offset = 0 } = req.query;
+    
+    const result = await db.query(`
       SELECT id, emp_code, full_name, position, department, 
-             line_id, line_name, status, created_at
+             line_id, line_name, status, mobile_enabled, created_at
       FROM employees
       ORDER BY emp_code
-    `);
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
     
     console.log(`Found ${result.rows.length} employees`);
     res.json({ success: true, employees: result.rows });
@@ -1123,9 +1075,9 @@ app.get('/api/admin/employees', async (req, res) => {
   }
 });
 
-// API - เพิ่มพนักงานใหม่
+// ⭐ API - เพิ่มข้อมูลการลงเวลาใหม่ (ปรับปรุงประสิทธิภาพ)
 app.post('/api/admin/time-logs', async (req, res) => {
-  console.log('API: admin/time-logs POST - เพิ่มข้อมูลการลงเวลาใหม่', req.body);
+  console.log('➕ API: admin/time-logs POST - เพิ่มข้อมูลการลงเวลาใหม่', req.body);
   
   try {
     const { employee_id, clock_in, clock_out, note, skip_notification } = req.body;
@@ -1134,8 +1086,7 @@ app.post('/api/admin/time-logs', async (req, res) => {
       return res.json({ success: false, message: 'กรุณาระบุข้อมูลที่จำเป็น' });
     }
     
-    // ตรวจสอบว่ามีพนักงานนี้ในระบบหรือไม่
-    const empResult = await getPool().query('SELECT id, full_name FROM employees WHERE id = $1', [employee_id]);
+    const empResult = await db.query('SELECT id, full_name FROM employees WHERE id = $1', [employee_id]);
     
     if (empResult.rows.length === 0) {
       return res.json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
@@ -1145,7 +1096,6 @@ app.post('/api/admin/time-logs', async (req, res) => {
     
     console.log('🚀 Starting time processing...');
     
-    // แปลงเวลาโดยใช้ฟังก์ชันใหม่
     const adjustedClockIn = processAdminDateTime(clock_in);
     const adjustedClockOut = clock_out ? processAdminDateTime(clock_out) : null;
     
@@ -1154,21 +1104,13 @@ app.post('/api/admin/time-logs', async (req, res) => {
     console.log('   Clock In (UTC):', adjustedClockIn);
     console.log('   Clock Out (UTC):', adjustedClockOut);
     
-    // ทดสอบแปลงกลับเป็นเวลาไทยเพื่อแสดง
-    if (adjustedClockIn) {
-      const testDisplay = new Date(adjustedClockIn);
-      const thaiDisplay = new Date(testDisplay.getTime() + (7 * 60 * 60 * 1000));
-      console.log('🇹🇭 Will display as Thai time:', thaiDisplay.toLocaleString('th-TH'));
-    }
-    
-    // เพิ่มข้อมูลการลงเวลา
     const insertQuery = `
       INSERT INTO time_logs (employee_id, clock_in, clock_out, note, status)
       VALUES ($1, $2, $3, $4, $5)
       RETURNING id
     `;
     
-    const result = await getPool().query(insertQuery, [
+    const result = await db.query(insertQuery, [
       employee_id, 
       adjustedClockIn, 
       adjustedClockOut, 
@@ -1181,57 +1123,56 @@ app.post('/api/admin/time-logs', async (req, res) => {
     
     // ส่งแจ้งเตือนถ้าไม่ได้ข้ามการแจ้งเตือน
     if (!skip_notification) {
-      try {
-        const notifySettingResult = await getPool().query(
-          'SELECT setting_value FROM settings WHERE setting_name = $1',
-          ['notify_clock_in']
-        );
-        
-        if (notifySettingResult.rows.length > 0 && notifySettingResult.rows[0].setting_value === '1') {
-          // ใช้เวลาไทยสำหรับการแจ้งเตือน
-          const clockInForNotify = new Date(adjustedClockIn);
-          const thaiTimeForNotify = new Date(clockInForNotify.getTime() + (7 * 60 * 60 * 1000));
-          
-          const thaiDate = thaiTimeForNotify.toLocaleDateString('th-TH');
-          const timeStr = thaiTimeForNotify.toLocaleTimeString('th-TH');
-          
-          let message =
-            `⏱ ลงเวลาเข้างาน (บันทึกโดยแอดมิน)\n` +
-            `👤 ชื่อ-นามสกุล: *${employee.full_name}*\n` +
-            `📅 วันที่: *${thaiDate}*\n` +
-            `🕒 เวลา: *${timeStr}*\n` +
-            (note ? `📝 หมายเหตุ: *${note}*\n` : "");
-          
-          await sendTelegramToAllGroups(message, null, null, employee.full_name);
-        }
-        
-        // การแจ้งเตือนสำหรับเวลาออก
-        if (adjustedClockOut) {
-          const notifyOutSettingResult = await getPool().query(
+      setImmediate(async () => {
+        try {
+          const notifySettingResult = await db.query(
             'SELECT setting_value FROM settings WHERE setting_name = $1',
-            ['notify_clock_out']
+            ['notify_clock_in']
           );
           
-          if (notifyOutSettingResult.rows.length > 0 && notifyOutSettingResult.rows[0].setting_value === '1') {
-            const clockOutForNotify = new Date(adjustedClockOut);
-            const thaiTimeForNotify = new Date(clockOutForNotify.getTime() + (7 * 60 * 60 * 1000));
+          if (notifySettingResult.rows.length > 0 && notifySettingResult.rows[0].setting_value === '1') {
+            const clockInForNotify = new Date(adjustedClockIn);
+            const thaiTimeForNotify = new Date(clockInForNotify.getTime() + (7 * 60 * 60 * 1000));
             
             const thaiDate = thaiTimeForNotify.toLocaleDateString('th-TH');
             const timeStr = thaiTimeForNotify.toLocaleTimeString('th-TH');
             
             let message =
-              `⏱ ลงเวลาออกงาน (บันทึกโดยแอดมิน)\n` +
+              `⏱ ลงเวลาเข้างาน (บันทึกโดยแอดมิน)\n` +
               `👤 ชื่อ-นามสกุล: *${employee.full_name}*\n` +
               `📅 วันที่: *${thaiDate}*\n` +
-              `🕒 เวลา: *${timeStr}*\n`;
+              `🕒 เวลา: *${timeStr}*\n` +
+              (note ? `📝 หมายเหตุ: *${note}*\n` : "");
             
             await sendTelegramToAllGroups(message, null, null, employee.full_name);
           }
+          
+          if (adjustedClockOut) {
+            const notifyOutSettingResult = await db.query(
+              'SELECT setting_value FROM settings WHERE setting_name = $1',
+              ['notify_clock_out']
+            );
+            
+            if (notifyOutSettingResult.rows.length > 0 && notifyOutSettingResult.rows[0].setting_value === '1') {
+              const clockOutForNotify = new Date(adjustedClockOut);
+              const thaiTimeForNotify = new Date(clockOutForNotify.getTime() + (7 * 60 * 60 * 1000));
+              
+              const thaiDate = thaiTimeForNotify.toLocaleDateString('th-TH');
+              const timeStr = thaiTimeForNotify.toLocaleTimeString('th-TH');
+              
+              let message =
+                `⏱ ลงเวลาออกงาน (บันทึกโดยแอดมิน)\n` +
+                `👤 ชื่อ-นามสกุล: *${employee.full_name}*\n` +
+                `📅 วันที่: *${thaiDate}*\n` +
+                `🕒 เวลา: *${timeStr}*\n`;
+              
+              await sendTelegramToAllGroups(message, null, null, employee.full_name);
+            }
+          }
+        } catch (notifyError) {
+          console.error('⚠️ Error sending notification:', notifyError.message);
         }
-      } catch (notifyError) {
-        console.error('⚠️ Error sending notification:', notifyError.message);
-        // ไม่ให้ notification error ขัดขวางการบันทึกข้อมูล
-      }
+      });
     }
     
     res.json({ success: true, message: 'เพิ่มข้อมูลการลงเวลาเรียบร้อยแล้ว', id: newId });
@@ -1243,16 +1184,15 @@ app.post('/api/admin/time-logs', async (req, res) => {
   }
 });
 
-// API - แก้ไขข้อมูลพนักงาน
+// ⭐ API - แก้ไขข้อมูลการลงเวลา
 app.put('/api/admin/time-logs/:id', async (req, res) => {
-  console.log('API: admin/time-logs/:id PUT - แก้ไขข้อมูลการลงเวลา', req.params, req.body);
+  console.log('✏️ API: admin/time-logs/:id PUT - แก้ไขข้อมูลการลงเวลา', req.params, req.body);
   
   try {
     const { id } = req.params;
     const { clock_in, clock_out, note } = req.body;
     
-    // ตรวจสอบว่ามีรายการนี้ในฐานข้อมูลหรือไม่
-    const checkResult = await getPool().query('SELECT id FROM time_logs WHERE id = $1', [id]);
+    const checkResult = await db.query('SELECT id FROM time_logs WHERE id = $1', [id]);
     
     if (checkResult.rows.length === 0) {
       return res.json({ success: false, message: 'ไม่พบข้อมูลการลงเวลา' });
@@ -1268,7 +1208,6 @@ app.put('/api/admin/time-logs/:id', async (req, res) => {
     console.log('   Clock In (UTC):', adjustedClockIn);
     console.log('   Clock Out (UTC):', adjustedClockOut);
     
-    // แก้ไขข้อมูล
     const updateQuery = `
       UPDATE time_logs SET 
       clock_in = $1, 
@@ -1277,7 +1216,7 @@ app.put('/api/admin/time-logs/:id', async (req, res) => {
       WHERE id = $4
     `;
     
-    await getPool().query(updateQuery, [adjustedClockIn, adjustedClockOut, note, id]);
+    await db.query(updateQuery, [adjustedClockIn, adjustedClockOut, note, id]);
     
     console.log(`✅ Updated time log ID: ${id}`);
     res.json({ success: true, message: 'แก้ไขข้อมูลการลงเวลาเรียบร้อยแล้ว' });
@@ -1285,6 +1224,133 @@ app.put('/api/admin/time-logs/:id', async (req, res) => {
   } catch (error) {
     console.error('❌ Error updating time log:', error);
     console.error('📋 Stack trace:', error.stack);
+    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
+  }
+});
+
+// ⭐ API - ลบข้อมูลการลงเวลา
+app.delete('/api/admin/time-logs/:id', async (req, res) => {
+  console.log('🗑️ API: admin/time-logs/:id DELETE - ลบข้อมูลการลงเวลา', req.params);
+  
+  try {
+    const { id } = req.params;
+    
+    const checkResult = await db.query('SELECT id FROM time_logs WHERE id = $1', [id]);
+    
+    if (checkResult.rows.length === 0) {
+      return res.json({ success: false, message: 'ไม่พบข้อมูลการลงเวลา' });
+    }
+    
+    await db.query('DELETE FROM time_logs WHERE id = $1', [id]);
+    
+    console.log(`Deleted time log ID: ${id}`);
+    res.json({ success: true, message: 'ลบข้อมูลการลงเวลาเรียบร้อยแล้ว' });
+  } catch (error) {
+    console.error('Error deleting time log:', error);
+    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
+  }
+});
+
+// ⭐ API - เพิ่มพนักงานใหม่ (ล้าง cache)
+app.post('/api/admin/employees', async (req, res) => {
+  console.log('➕ API: admin/employees POST - เพิ่มพนักงานใหม่', req.body);
+  
+  try {
+    const { emp_code, full_name, position, department } = req.body;
+    
+    if (!emp_code || !full_name) {
+      return res.json({ success: false, message: 'กรุณาระบุรหัสพนักงานและชื่อ-นามสกุล' });
+    }
+    
+    const checkResult = await db.query('SELECT id FROM employees WHERE emp_code = $1', [emp_code]);
+    
+    if (checkResult.rows.length > 0) {
+      return res.json({ success: false, message: 'รหัสพนักงานนี้มีอยู่ในระบบแล้ว' });
+    }
+    
+    const insertResult = await db.query(
+      `INSERT INTO employees (emp_code, full_name, position, department, status, mobile_enabled)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [emp_code, full_name, position || null, department || null, 'active', true]
+    );
+    
+    // ล้าง cache
+    clearEmployeeCache();
+    
+    const newId = insertResult.rows[0].id;
+    
+    console.log(`เพิ่มพนักงานใหม่สำเร็จ ID: ${newId}`);
+    res.json({ 
+      success: true, 
+      message: 'เพิ่มพนักงานเรียบร้อยแล้ว',
+      id: newId
+    });
+    
+  } catch (error) {
+    console.error('Error adding employee:', error);
+    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
+  }
+});
+
+// API - แก้ไขข้อมูลพนักงาน
+app.put('/api/admin/employees/:id', async (req, res) => {
+  console.log('API: admin/employees/:id PUT - แก้ไขข้อมูลพนักงาน', req.params, req.body);
+  
+  try {
+    const { id } = req.params;
+    const { emp_code, full_name, position, department, status, mobile_enabled } = req.body;
+    
+    if (!emp_code || !full_name) {
+      return res.json({ success: false, message: 'กรุณาระบุรหัสพนักงานและชื่อ-นามสกุล' });
+    }
+    
+    // ตรวจสอบว่ามีพนักงานนี้ในระบบหรือไม่
+    const checkResult = await db.query('SELECT id FROM employees WHERE id = $1', [id]);
+    
+    if (checkResult.rows.length === 0) {
+      return res.json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+    }
+    
+    // ตรวจสอบว่ารหัสพนักงานซ้ำกับคนอื่นหรือไม่ (ยกเว้นตัวเอง)
+    const duplicateResult = await db.query(
+      'SELECT id FROM employees WHERE emp_code = $1 AND id != $2',
+      [emp_code, id]
+    );
+    
+    if (duplicateResult.rows.length > 0) {
+      return res.json({ success: false, message: 'รหัสพนักงานนี้มีอยู่ในระบบแล้ว' });
+    }
+    
+    // แก้ไขข้อมูลพนักงาน
+    const updateQuery = `
+      UPDATE employees SET 
+      emp_code = $1, 
+      full_name = $2, 
+      position = $3, 
+      department = $4,
+      status = $5,
+      mobile_enabled = $6
+      WHERE id = $7
+    `;
+    
+    await db.query(updateQuery, [
+      emp_code, 
+      full_name, 
+      position || null, 
+      department || null,
+      status || 'active',
+      mobile_enabled !== undefined ? mobile_enabled : true,
+      id
+    ]);
+    
+    // ล้าง cache
+    clearEmployeeCache();
+    
+    console.log(`แก้ไขข้อมูลพนักงาน ID: ${id} เรียบร้อยแล้ว`);
+    res.json({ success: true, message: 'แก้ไขข้อมูลพนักงานเรียบร้อยแล้ว' });
+    
+  } catch (error) {
+    console.error('Error updating employee:', error);
     res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
   }
 });
@@ -1297,7 +1363,7 @@ app.delete('/api/admin/employees/:id', async (req, res) => {
     const { id } = req.params;
     
     // ตรวจสอบว่าพนักงานมีในระบบหรือไม่
-    const employeeResult = await getPool().query(
+    const employeeResult = await db.query(
       'SELECT id, full_name FROM employees WHERE id = $1',
       [id]
     );
@@ -1308,11 +1374,11 @@ app.delete('/api/admin/employees/:id', async (req, res) => {
     
     const employee = employeeResult.rows[0];
     
-    // ลบพนักงาน
-    await getPool().query(
-      'DELETE FROM employees WHERE id = $1',
-      [id]
-    );
+    // ลบพนักงาน (hard delete)
+    await db.query('DELETE FROM employees WHERE id = $1', [id]);
+    
+    // ล้าง cache
+    clearEmployeeCache();
     
     console.log('Permanently deleted employee with ID:', id, '(', employee.full_name, ')');
     res.json({ success: true, message: 'ลบพนักงานเรียบร้อยแล้ว' });
@@ -1327,7 +1393,7 @@ app.get('/api/admin/settings', async (req, res) => {
   console.log('API: admin/settings - ดึงการตั้งค่าทั้งหมด');
   
   try {
-    const result = await getPool().query('SELECT * FROM settings');
+    const result = await db.query('SELECT * FROM settings ORDER BY setting_name');
     
     // ซ่อนรหัสผ่านแอดมิน
     const filteredSettings = result.rows.map(setting => {
@@ -1356,12 +1422,7 @@ app.post('/api/admin/settings', async (req, res) => {
       return res.json({ success: false, message: 'ข้อมูลไม่ถูกต้อง' });
     }
     
-    const client = await pool.connect();
-    
-    try {
-      // เริ่มต้น transaction
-      await client.query('BEGIN');
-      
+    await db.withTransaction(async (client) => {
       // บันทึกการตั้งค่าทีละรายการ
       for (const setting of settings) {
         if (setting.name && setting.value !== undefined) {
@@ -1371,20 +1432,14 @@ app.post('/api/admin/settings', async (req, res) => {
           );
         }
       }
-      
-      await client.query('COMMIT');
-      console.log('Settings updated successfully');
-      res.json({ success: true, message: 'บันทึกการตั้งค่าเรียบร้อยแล้ว' });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      console.error('Error updating settings:', err);
-      res.json({ success: false, message: 'เกิดข้อผิดพลาดในการบันทึกการตั้งค่า: ' + err.message });
-    } finally {
-      client.release();
-    }
+    });
+    
+    console.log('Settings updated successfully');
+    res.json({ success: true, message: 'บันทึกการตั้งค่าเรียบร้อยแล้ว' });
+    
   } catch (error) {
     console.error('Error updating settings:', error);
-    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
+    res.json({ success: false, message: 'เกิดข้อผิดพลาดในการบันทึกการตั้งค่า: ' + error.message });
   }
 });
 
@@ -1395,33 +1450,12 @@ app.get('/api/admin/dashboard', async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     
-    // จำนวนพนักงานทั้งหมด
-    const totalEmployeesResult = await getPool().query(
-      'SELECT COUNT(*) as count FROM employees WHERE status = $1',
-      ['active']
-    );
-    const totalEmployees = parseInt(totalEmployeesResult.rows[0].count);
-    
-    // จำนวนพนักงานที่ลงเวลาวันนี้
-    const checkedInTodayResult = await getPool().query(
-      `SELECT COUNT(DISTINCT employee_id) as count 
-       FROM time_logs 
-       WHERE DATE(clock_in) = $1`,
-      [today]
-    );
-    const checkedInToday = parseInt(checkedInTodayResult.rows[0].count);
-    
-    // จำนวนพนักงานที่ยังไม่ลงเวลาออกวันนี้
-    const notCheckedOutTodayResult = await getPool().query(
-      `SELECT COUNT(*) as count 
-       FROM time_logs 
-       WHERE DATE(clock_in) = $1 AND clock_out IS NULL`,
-      [today]
-    );
-    const notCheckedOutToday = parseInt(notCheckedOutTodayResult.rows[0].count);
+    // ใช้ prepared statement สำหรับ dashboard
+    const result = await db.executePrepared('GET_DASHBOARD_STATS', [today]);
+    const stats = result.rows[0];
     
     // ข้อมูลการลงเวลาล่าสุด 10 รายการ
-    const recentLogsResult = await getPool().query(
+    const recentLogsResult = await db.query(
       `SELECT t.id, e.emp_code, e.full_name, t.clock_in, t.clock_out, t.note
        FROM time_logs t
        JOIN employees e ON t.employee_id = e.id
@@ -1431,7 +1465,6 @@ app.get('/api/admin/dashboard', async (req, res) => {
     
     // ปรับรูปแบบวันที่เวลา และตรวจสอบค่า null
     const formattedLogs = recentLogsResult.rows.filter(log => log && log.clock_in).map(log => {
-      // ปรับเวลาให้เป็นเวลาไทย
       const clockInDate = new Date(new Date(log.clock_in).getTime() + (7 * 60 * 60 * 1000));
       const clockOutDate = log.clock_out ? new Date(new Date(log.clock_out).getTime() + (7 * 60 * 60 * 1000)) : null;
       
@@ -1448,9 +1481,9 @@ app.get('/api/admin/dashboard', async (req, res) => {
     res.json({
       success: true,
       dashboard: {
-        totalEmployees,
-        checkedInToday,
-        notCheckedOutToday,
+        totalEmployees: parseInt(stats.total_employees) || 0,
+        checkedInToday: parseInt(stats.checked_in_today) || 0,
+        notCheckedOutToday: parseInt(stats.not_checked_out_today) || 0,
         recentLogs: formattedLogs
       }
     });
@@ -1460,21 +1493,12 @@ app.get('/api/admin/dashboard', async (req, res) => {
   }
 });
 
-// เพิ่ม route สำหรับหน้าแอดมิน
-app.get('/admin/*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', req.path));
-});
-
 // API พิเศษสำหรับรีเซ็ตข้อมูลแอดมิน
 app.get('/api/reset-admin', async (req, res) => {
   console.log('API: reset-admin - รีเซ็ตข้อมูลแอดมิน');
   
   try {
-    const client = await pool.connect();
-    
-    try {
-      await client.query('BEGIN');
-      
+    await db.withTransaction(async (client) => {
       // ลบข้อมูลเดิม (ถ้ามี)
       await client.query(
         'DELETE FROM settings WHERE setting_name = $1 OR setting_name = $2',
@@ -1491,73 +1515,664 @@ app.get('/api/reset-admin', async (req, res) => {
         'INSERT INTO settings (setting_name, setting_value, description) VALUES ($1, $2, $3)',
         ['admin_password', 'admin123', 'รหัสผ่านสำหรับแอดมิน']
       );
-      
-      await client.query('COMMIT');
-      console.log('Admin credentials reset successfully');
-      res.json({ success: true, message: 'รีเซ็ตข้อมูลแอดมินเรียบร้อยแล้ว' });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      console.error('Error resetting admin credentials:', err);
-      res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + err.message });
-    } finally {
-      client.release();
-    }
+    });
+    
+    console.log('Admin credentials reset successfully');
+    res.json({ success: true, message: 'รีเซ็ตข้อมูลแอดมินเรียบร้อยแล้ว' });
+    
   } catch (error) {
     console.error('Error resetting admin:', error);
     res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
   }
 });
 
-// API - ดึง LIFF ID
-app.get('/api/getLiffId', async (req, res) => {
-  console.log('API: getLiffId - ดึง LIFF ID');
-  
+// server.js - Mobile Time Tracker Server (ส่วนที่ 6/8)
+// Mobile API Routes และ Notification Functions
+
+// ⭐ ฟังก์ชันส่งแจ้งเตือนที่ปรับปรุงแล้ว
+async function sendNotification(type, employee, timestamp, userinfo, lat, lon, line_name) {
   try {
-    const result = await getPool().query(
+    const notifySettingResult = await db.query(
       'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['liff_id']
+      [type === 'clock_in' ? 'notify_clock_in' : 'notify_clock_out']
     );
+
+    if (notifySettingResult.rows.length === 0 || notifySettingResult.rows[0].setting_value !== '1') {
+      return;
+    }
+
+    const date = new Date(timestamp);
+    const thaiFormatter = new Intl.DateTimeFormat('th-TH', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      weekday: 'long'
+    });
+    const thaiDate = thaiFormatter.format(date);
+
+    const hours = String(date.getUTCHours() + 7).padStart(2, '0');
+    const minutes = String(date.getUTCMinutes()).padStart(2, '0');
+    const seconds = String(date.getUTCSeconds()).padStart(2, '0');
+    const returnDate = `${hours}:${minutes}:${seconds}`;
+
+    const location = lat && lon ? `${lat}, ${lon}` : "ไม่มีข้อมูล";
+
+    let message = type === 'clock_in' 
+      ? `⏱ ลงเวลาเข้างาน\n`
+      : `⏱ ลงเวลาออกงาน\n`;
     
-    if (result.rows.length > 0) {
-      return res.json({ success: true, liffId: result.rows[0].setting_value });
+    message += `👤 ชื่อ-นามสกุล: *${employee}*\n`;
+    message += `📅 วันที่: *${thaiDate}*\n`;
+    message += `🕒 เวลา: *${returnDate}*\n`;
+    
+    if (line_name) message += `💬 ชื่อไลน์: *${line_name}*\n`;
+    if (userinfo && type === 'clock_in') message += `📝 หมายเหตุ: *${userinfo}*\n`;
+    if (lat && lon) {
+      message += `📍 พิกัด: *${location}*\n`;
+      message += `🗺 แผนที่: [ดูแผนที่](https://www.google.com/maps/place/${lat},${lon})`;
     } else {
-      // ถ้าไม่พบ LIFF ID ในฐานข้อมูล ให้ใช้ค่าเริ่มต้น
-      return res.json({ success: true, liffId: '2001032478-VR5Akj0k' });
+      message += "📍 พิกัด: *ไม่มีข้อมูล*";
+    }
+
+    await sendTelegramToAllGroups(message, lat, lon, employee);
+  } catch (error) {
+    console.error('❌ Error in sendNotification:', error);
+  }
+}
+
+// ⭐ ฟังก์ชันส่ง Telegram ที่ปรับปรุงแล้ว
+async function sendTelegramToAllGroups(message, lat, lon, employee) {
+  try {
+    const [tokenResult, gasUrlResult, groupsResult] = await Promise.all([
+      db.query('SELECT setting_value FROM settings WHERE setting_name = $1', ['telegram_bot_token']),
+      db.query('SELECT setting_value FROM settings WHERE setting_name = $1', ['gas_web_app_url']),
+      db.query('SELECT setting_value FROM settings WHERE setting_name = $1', ['telegram_groups'])
+    ]);
+    
+    if (tokenResult.rows.length === 0 || !tokenResult.rows[0].setting_value) {
+      console.error('❌ Error getting Telegram token or token not set');
+      return;
+    }
+    
+    let gasUrl = 'https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec';
+    if (gasUrlResult.rows.length > 0 && gasUrlResult.rows[0].setting_value) {
+      gasUrl = gasUrlResult.rows[0].setting_value.trim();
+    } else {
+      console.log('ไม่พบ URL ของ GSA ในฐานข้อมูล ใช้ค่าเริ่มต้น');
+    }
+    
+    if (groupsResult.rows.length === 0 || !groupsResult.rows[0].setting_value) {
+      console.error('❌ No Telegram groups configured');
+      return;
+    }
+    
+    const token = tokenResult.rows[0].setting_value;
+    
+    try {
+      const groups = JSON.parse(groupsResult.rows[0].setting_value);
+      
+      // ส่งแจ้งเตือนแบบ parallel
+      const promises = groups
+        .filter(group => group.active && group.chat_id)
+        .map(async (group) => {
+          try {
+            console.log(`Sending message to ${group.name} (${group.chat_id}) via GSA`);
+            
+            const jsonData = {
+              message: message,
+              chatId: group.chat_id,
+              token: token
+            };
+            
+            if (lat && lon) {
+              jsonData.lat = lat;
+              jsonData.lon = lon;
+            }
+            
+            const encodedData = encodeURIComponent(JSON.stringify(jsonData));
+            const urlWithParams = `${gasUrl}?opt=sendToTelegram&data=${encodedData}`;
+            
+            console.log('Sending request to GSA:', urlWithParams);
+            
+            const response = await axios.get(urlWithParams, { timeout: 10000 });
+            
+            console.log(`✅ Message sent to ${group.name} via GSA successfully:`, response.data);
+            return response.data;
+          } catch (error) {
+            console.error(`❌ Error sending message to ${group.name} via GSA:`, error.message);
+            console.error('Error details:', error.response?.data || error);
+            return null;
+          }
+        });
+    
+      await Promise.allSettled(promises);
+    } catch (error) {
+      console.error('❌ Error parsing Telegram groups:', error.message);
     }
   } catch (error) {
-    console.error('Error getting LIFF ID:', error);
-    return res.json({ success: false, error: error.message });
+    console.error('❌ Error in sendTelegramToAllGroups:', error.message);
+  }
+}
+
+// --- Mobile-Specific API Routes ---
+const mobileApiBase = '/api/mobile';
+
+// ⭐ Mobile - ดึงรายชื่อพนักงาน
+app.get(`${mobileApiBase}/employees`, async (req, res) => {
+  console.log('📱 Mobile API: employees - ดึงรายชื่อพนักงาน');
+  
+  try {
+    const employees = await getEmployeesFromCache();
+    
+    // แปลงเป็นรูปแบบที่ Mobile ต้องการ
+    const mobileEmployees = employees.map(emp => ({
+      name: emp[0],
+      code: emp[1] || emp[0], // ใช้ชื่อเป็น code ถ้าไม่มี code
+      id: emp[0] // ใช้ชื่อเป็น ID
+    }));
+    
+    res.json({
+      success: true,
+      employees: mobileEmployees,
+      count: mobileEmployees.length
+    });
+  } catch (error) {
+    console.error('❌ Mobile API employees error:', error);
+    res.json({
+      success: false,
+      message: 'ไม่สามารถดึงรายชื่อพนักงานได้',
+      employees: []
+    });
   }
 });
 
-// API - ทดสอบการลงเวลาเข้า (สำหรับการทดสอบโดยไม่ต้องผ่าน LIFF)
+// ⭐ Mobile - ตรวจสอบสถานะการลงเวลา
+app.get(`${mobileApiBase}/status/:employeeName`, async (req, res) => {
+  console.log('📱 Mobile API: status - ตรวจสอบสถานะ', req.params);
+  
+  try {
+    const { employeeName } = req.params;
+    const today = new Date().toISOString().split('T')[0];
+    
+    // หาพนักงาน
+    const empResult = await db.executePrepared('GET_EMPLOYEE_BY_CODE', [employeeName]);
+    
+    if (empResult.rows.length === 0) {
+      return res.json({
+        success: false,
+        status: 'employee_not_found',
+        message: 'ไม่พบข้อมูลพนักงาน'
+      });
+    }
+    
+    const emp = empResult.rows[0];
+    
+    // ตรวจสอบการลงเวลาวันนี้
+    const recordResult = await db.executePrepared('GET_TODAY_RECORD', [emp.id, today]);
+    
+    if (recordResult.rows.length === 0) {
+      return res.json({
+        success: true,
+        status: 'not_clocked_in',
+        message: 'ยังไม่ได้ลงเวลาเข้า',
+        employee_name: emp.full_name
+      });
+    }
+    
+    const record = recordResult.rows[0];
+    
+    if (!record.clock_out) {
+      // คำนวณเวลาเข้างาน
+      const clockInTime = new Date(new Date(record.clock_in).getTime() + (7 * 60 * 60 * 1000));
+      
+      return res.json({
+        success: true,
+        status: 'clocked_in',
+        message: 'ลงเวลาเข้าแล้ว กำลังทำงาน',
+        employee_name: emp.full_name,
+        clock_in_time: clockInTime.toLocaleTimeString('th-TH')
+      });
+    } else {
+      // คำนวณเวลาเข้า-ออก
+      const clockInTime = new Date(new Date(record.clock_in).getTime() + (7 * 60 * 60 * 1000));
+      const clockOutTime = new Date(new Date(record.clock_out).getTime() + (7 * 60 * 60 * 1000));
+      
+      return res.json({
+        success: true,
+        status: 'completed',
+        message: 'ลงเวลาครบแล้ววันนี้',
+        employee_name: emp.full_name,
+        clock_in_time: clockInTime.toLocaleTimeString('th-TH'),
+        clock_out_time: clockOutTime.toLocaleTimeString('th-TH')
+      });
+    }
+    
+  } catch (error) {
+    console.error('❌ Mobile API status error:', error);
+    res.json({
+      success: false,
+      status: 'error',
+      message: 'เกิดข้อผิดพลาด: ' + error.message
+    });
+  }
+});
+
+// ⭐ Mobile - ดึงประวัติการลงเวลา
+app.get(`${mobileApiBase}/history/:employeeName`, async (req, res) => {
+  console.log('📱 Mobile API: history - ดึงประวัติการลงเวลา', req.params);
+  
+  try {
+    const { employeeName } = req.params;
+    const { limit = 7 } = req.query;
+    
+    // หาพนักงาน
+    const empResult = await db.executePrepared('GET_EMPLOYEE_BY_CODE', [employeeName]);
+    
+    if (empResult.rows.length === 0) {
+      return res.json({
+        success: false,
+        message: 'ไม่พบข้อมูลพนักงาน',
+        history: []
+      });
+    }
+    
+    const emp = empResult.rows[0];
+    
+    // ดึงประวัติ
+    const historyResult = await db.executePrepared('GET_EMPLOYEE_HISTORY', [emp.id, limit]);
+    
+    const history = historyResult.rows.map(log => {
+      const clockInDate = new Date(new Date(log.clock_in).getTime() + (7 * 60 * 60 * 1000));
+      const clockOutDate = log.clock_out ? new Date(new Date(log.clock_out).getTime() + (7 * 60 * 60 * 1000)) : null;
+      
+      return {
+        date: clockInDate.toLocaleDateString('th-TH'),
+        clock_in: clockInDate.toLocaleTimeString('th-TH'),
+        clock_out: clockOutDate ? clockOutDate.toLocaleTimeString('th-TH') : null,
+        note: log.note || '',
+        status: log.status || 'normal',
+        duration: clockOutDate ? calculateDuration(new Date(log.clock_in), new Date(log.clock_out)) : null
+      };
+    });
+    
+    res.json({
+      success: true,
+      history: history,
+      employee_name: emp.full_name
+    });
+    
+  } catch (error) {
+    console.error('❌ Mobile API history error:', error);
+    res.json({
+      success: false,
+      message: 'เกิดข้อผิดพลาด: ' + error.message,
+      history: []
+    });
+  }
+});
+
+// ⭐ Mobile - Dashboard สำหรับ mobile
+app.get(`${mobileApiBase}/dashboard`, async (req, res) => {
+  console.log('📱 Mobile API: dashboard - ดึงข้อมูลแดชบอร์ด');
+  
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    
+    // ใช้ prepared statement
+    const result = await db.executePrepared('GET_DASHBOARD_STATS', [today]);
+    const stats = result.rows[0];
+    
+    res.json({
+      success: true,
+      today: {
+        date: new Date().toLocaleDateString('th-TH'),
+        total_employees: parseInt(stats.total_employees) || 0,
+        checked_in: parseInt(stats.checked_in_today) || 0,
+        not_checked_out: parseInt(stats.not_checked_out_today) || 0,
+        checked_out: (parseInt(stats.checked_in_today) || 0) - (parseInt(stats.not_checked_out_today) || 0)
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Mobile API dashboard error:', error);
+    res.json({
+      success: false,
+      message: 'เกิดข้อผิดพลาด: ' + error.message,
+      today: {
+        total_employees: 0,
+        checked_in: 0,
+        not_checked_out: 0,
+        checked_out: 0
+      }
+    });
+  }
+});
+
+// ⭐ Mobile - Batch API สำหรับเรียก API หลายตัวพร้วมกัน
+app.post(`${mobileApiBase}/batch`, async (req, res) => {
+  console.log('📱 Mobile API: batch - ประมวลผลคำขอหลายรายการ', req.body);
+  
+  try {
+    const { operations } = req.body;
+    
+    if (!Array.isArray(operations)) {
+      return res.json({
+        success: false,
+        message: 'operations ต้องเป็น array'
+      });
+    }
+    
+    const results = [];
+    
+    for (const operation of operations) {
+      try {
+        let result = { success: false, data: null };
+        
+        switch (operation.type) {
+          case 'get_settings':
+            const settingsResult = await db.query('SELECT * FROM settings');
+            const settings = {};
+            settingsResult.rows.forEach(row => {
+              settings[row.setting_name] = row.setting_value;
+            });
+            result = { success: true, data: settings };
+            break;
+            
+          case 'get_liff_id':
+            const liffResult = await db.query(
+              'SELECT setting_value FROM settings WHERE setting_name = $1',
+              ['liff_id']
+            );
+            result = {
+              success: true,
+              data: {
+                liff_id: liffResult.rows.length > 0 ? liffResult.rows[0].setting_value : '2001032478-VR5Akj0k'
+              }
+            };
+            break;
+            
+          default:
+            result = { success: false, data: null, message: 'Unknown operation type' };
+        }
+        
+        results.push(result);
+        
+      } catch (error) {
+        console.error('❌ Batch operation error:', operation, error);
+        results.push({
+          success: false,
+          data: null,
+          message: error.message
+        });
+      }
+    }
+    
+    res.json({
+      success: true,
+      results: results
+    });
+    
+  } catch (error) {
+    console.error('❌ Mobile API batch error:', error);
+    res.json({
+      success: false,
+      message: 'เกิดข้อผิดพลาด: ' + error.message,
+      results: []
+    });
+  }
+});
+
+// ⭐ Mobile - ปรับปรุง clockin API ให้รองรับ mobile response
+app.post(`${mobileApiBase}/clockin`, async (req, res) => {
+  console.log('📱 Mobile API: clockin - บันทึกเวลาเข้า (Mobile)', req.body);
+  
+  try {
+    const { 
+      employee, 
+      userinfo, 
+      lat, 
+      lon, 
+      line_name, 
+      line_picture, 
+      client_time 
+    } = req.body;
+    
+    if (!employee) {
+      return res.json({ 
+        success: false,
+        message: 'กรุณาระบุชื่อพนักงาน' 
+      });
+    }
+    
+    // ใช้ prepared statement
+    const empResult = await db.executePrepared('GET_EMPLOYEE_BY_CODE', [employee]);
+    
+    if (empResult.rows.length === 0) {
+      return res.json({ 
+        success: false,
+        message: 'ไม่พบข้อมูลพนักงาน' 
+      });
+    }
+    
+    const emp = empResult.rows[0];
+    const today = new Date().toISOString().split('T')[0];
+    
+    // ตรวจสอบการลงเวลาซ้ำ
+    const checkExistingResult = await db.executePrepared('CHECK_CLOCK_IN_TODAY', [emp.id, today]);
+    
+    if (checkExistingResult.rows.length > 0) {
+      return res.json({ 
+        success: false,
+        message: 'คุณได้ลงเวลาเข้าแล้ววันนี้'
+      });
+    }
+    
+    const now = client_time ? adjustClientTime(client_time) : new Date().toISOString();
+    
+    // บันทึกเวลาเข้า
+    await db.executePrepared('INSERT_TIME_LOG', [
+      emp.id, now, userinfo || null, lat || null, lon || null, line_name || null, line_picture || null
+    ]);
+    
+    // ส่งแจ้งเตือน (ไม่รอผลลัพธ์)
+    setImmediate(async () => {
+      try {
+        await sendNotification('clock_in', employee, now, userinfo, lat, lon, line_name);
+      } catch (error) {
+        console.error('❌ Notification error:', error);
+      }
+    });
+    
+    // ปรับเวลาเป็นเวลาไทย
+    const date = new Date(now);
+    const thaiTime = new Date(date.getTime() + (7 * 60 * 60 * 1000));
+    const timeString = thaiTime.toLocaleTimeString('th-TH');
+    
+    return res.json({
+      success: true,
+      message: `ลงเวลาเข้า ${timeString} เรียบร้อย`,
+      time: timeString,
+      timestamp: now,
+      employee: employee
+    });
+    
+  } catch (error) {
+    console.error('❌ Error in mobile clockin:', error);
+    return res.json({ 
+      success: false,
+      message: 'เกิดข้อผิดพลาด: ' + error.message 
+    });
+  }
+});
+
+// ⭐ Mobile - ปรับปรุง clockout API ให้รองรับ mobile response
+app.post(`${mobileApiBase}/clockout`, async (req, res) => {
+  console.log('📱 Mobile API: clockout - บันทึกเวลาออก (Mobile)', req.body);
+  
+  try {
+    const { 
+      employee, 
+      lat, 
+      lon, 
+      line_name, 
+      line_picture, 
+      client_time 
+    } = req.body;
+    
+    if (!employee) {
+      return res.json({ 
+        success: false,
+        message: 'กรุณาระบุชื่อพนักงาน' 
+      });
+    }
+    
+    const empResult = await db.executePrepared('GET_EMPLOYEE_BY_CODE', [employee]);
+    
+    if (empResult.rows.length === 0) {
+      return res.json({ 
+        success: false,
+        message: 'ไม่พบข้อมูลพนักงาน' 
+      });
+    }
+    
+    const emp = empResult.rows[0];
+    const today = new Date().toISOString().split('T')[0];
+    
+    const recordResult = await db.executePrepared('GET_TODAY_RECORD', [emp.id, today]);
+    
+    if (recordResult.rows.length === 0) {
+      return res.json({ 
+        success: false,
+        message: 'คุณยังไม่ได้ลงเวลาเข้าวันนี้'
+      });
+    }
+    
+    const record = recordResult.rows[0];
+    
+    if (record.clock_out) {
+      return res.json({ 
+        success: false,
+        message: 'คุณได้ลงเวลาออกแล้ววันนี้'
+      });
+    }
+    
+    const now = client_time ? adjustClientTime(client_time) : new Date().toISOString();
+    
+    // บันทึกเวลาออก
+    await db.executePrepared('UPDATE_CLOCK_OUT', [
+      now, lat || null, lon || null, line_name || null, line_picture || null, record.id
+    ]);
+    
+    // ส่งแจ้งเตือน (ไม่รอผลลัพธ์)
+    setImmediate(async () => {
+      try {
+        await sendNotification('clock_out', employee, now, null, lat, lon, line_name);
+      } catch (error) {
+        console.error('❌ Notification error:', error);
+      }
+    });
+    
+    // ปรับเวลาเป็นเวลาไทย
+    const date = new Date(now);
+    const thaiTime = new Date(date.getTime() + (7 * 60 * 60 * 1000));
+    const timeString = thaiTime.toLocaleTimeString('th-TH');
+    
+    return res.json({
+      success: true,
+      message: `ลงเวลาออก ${timeString} เรียบร้อย`,
+      time: timeString,
+      timestamp: now,
+      employee: employee
+    });
+    
+  } catch (error) {
+    console.error('❌ Error in mobile clockout:', error);
+    return res.json({ 
+      success: false,
+      message: 'เกิดข้อผิดพลาด: ' + error.message 
+    });
+  }
+});
+
+// ⭐ Mobile - Health Check และ App Info
+app.get(`${mobileApiBase}/health`, (req, res) => {
+  res.json({
+    success: true,
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    server_time: new Date().toLocaleString('th-TH'),
+    timezone: 'Asia/Bangkok',
+    version: '1.0.0'
+  });
+});
+
+// ⭐ Mobile - App Configuration
+app.get(`${mobileApiBase}/config`, async (req, res) => {
+  try {
+    const [liffResult, offsetResult, orgResult] = await Promise.all([
+      db.query('SELECT setting_value FROM settings WHERE setting_name = $1', ['liff_id']),
+      db.query('SELECT setting_value FROM settings WHERE setting_name = $1', ['time_offset']),
+      db.query('SELECT setting_value FROM settings WHERE setting_name = $1', ['organization_name'])
+    ]);
+    
+    res.json({
+      success: true,
+      config: {
+        liff_id: liffResult.rows.length > 0 ? liffResult.rows[0].setting_value : '2001032478-VR5Akj0k',
+        time_offset: offsetResult.rows.length > 0 ? parseInt(offsetResult.rows[0].setting_value) : 420,
+        organization_name: orgResult.rows.length > 0 ? orgResult.rows[0].setting_value : 'องค์การบริหารส่วนตำบลหัวนา',
+        features: {
+          location_required: true,
+          notification_enabled: true,
+          offline_mode: true
+        }
+      }
+    });
+  } catch (error) {
+    console.error('❌ Mobile config error:', error);
+    res.json({
+      success: false,
+      message: 'เกิดข้อผิดพลาด: ' + error.message,
+      config: {
+        liff_id: '2001032478-VR5Akj0k',
+        time_offset: 420,
+        organization_name: 'องค์การบริหารส่วนตำบลหัวนา'
+      }
+    });
+  }
+});
+
+// ⭐ เพิ่ม Error Handler สำหรับ Mobile API
+app.use(`${mobileApiBase}/*`, (err, req, res, next) => {
+  console.error('❌ Mobile API Error:', err);
+  res.status(500).json({
+    success: false,
+    message: 'เกิดข้อผิดพลาดภายในเซิร์ฟเวอร์',
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
+});
+
+// ⭐ Test APIs สำหรับการทดสอบ
 app.post('/api/test-clockin', async (req, res) => {
   console.log('API: test-clockin - ทดสอบการลงเวลาเข้า', req.body);
   
   try {
     const { employee, userinfo } = req.body;
     
-    // ตรวจสอบว่ามีชื่อพนักงาน
     if (!employee) {
       return res.json({ msg: 'กรุณาระบุชื่อพนักงาน' });
     }
     
-    // ค้นหาพนักงานจากชื่อหรือรหัส
-    const empResult = await getPool().query('SELECT id FROM employees WHERE emp_code = $1 OR full_name = $1', [employee]);
+    const empResult = await db.executePrepared('GET_EMPLOYEE_BY_CODE', [employee]);
     
     if (empResult.rows.length === 0) {
       return res.json({ msg: 'ไม่พบข้อมูลพนักงาน' });
     }
     
     const emp = empResult.rows[0];
-    
-    // ตรวจสอบว่าลงเวลาเข้าซ้ำหรือไม่
     const today = new Date().toISOString().split('T')[0];
     
-    const checkExistingResult = await getPool().query(
-      'SELECT id FROM time_logs WHERE employee_id = $1 AND DATE(clock_in) = $2',
-      [emp.id, today]
-    );
+    const checkExistingResult = await db.executePrepared('CHECK_CLOCK_IN_TODAY', [emp.id, today]);
     
     if (checkExistingResult.rows.length > 0) {
       return res.json({ 
@@ -1566,17 +2181,12 @@ app.post('/api/test-clockin', async (req, res) => {
       });
     }
     
-    // บันทึกเวลาเข้า
     const now = new Date().toISOString();
     
-    await getPool().query(
-      `INSERT INTO time_logs 
-      (employee_id, clock_in, note, latitude_in, longitude_in)
-      VALUES ($1, $2, $3, $4, $5)`,
-      [emp.id, now, userinfo || null, 13.7563 || null, 100.5018 || null]
-    );
+    await db.executePrepared('INSERT_TIME_LOG', [
+      emp.id, now, userinfo || null, 13.7563 || null, 100.5018 || null, null, null
+    ]);
     
-    // ปรับเวลาเป็นเวลาไทย
     const utcTime = new Date(now);
     const thaiTime = new Date(utcTime.getTime() + (7 * 60 * 60 * 1000));
     const returnDate = thaiTime.toLocaleTimeString('th-TH');
@@ -1593,37 +2203,26 @@ app.post('/api/test-clockin', async (req, res) => {
   }
 });
 
-// API - ทดสอบการลงเวลาออก (สำหรับการทดสอบโดยไม่ต้องผ่าน LIFF)
 app.post('/api/test-clockout', async (req, res) => {
   console.log('API: test-clockout - ทดสอบการลงเวลาออก', req.body);
   
   try {
     const { employee } = req.body;
     
-    // ตรวจสอบว่ามีชื่อพนักงาน
     if (!employee) {
       return res.json({ msg: 'กรุณาระบุชื่อพนักงาน' });
     }
     
-    // ค้นหาพนักงานจากชื่อหรือรหัส
-    const empResult = await getPool().query(
-      'SELECT id FROM employees WHERE emp_code = $1 OR full_name = $1',
-      [employee]
-    );
+    const empResult = await db.executePrepared('GET_EMPLOYEE_BY_CODE', [employee]);
     
     if (empResult.rows.length === 0) {
       return res.json({ msg: 'ไม่พบข้อมูลพนักงาน' });
     }
     
     const emp = empResult.rows[0];
-    
-    // ตรวจสอบว่าลงเวลาเข้าวันนี้หรือไม่
     const today = new Date().toISOString().split('T')[0];
     
-    const recordResult = await getPool().query(
-      'SELECT id, clock_out FROM time_logs WHERE employee_id = $1 AND DATE(clock_in) = $2 ORDER BY clock_in DESC LIMIT 1',
-      [emp.id, today]
-    );
+    const recordResult = await db.executePrepared('GET_TODAY_RECORD', [emp.id, today]);
     
     if (recordResult.rows.length === 0) {
       return res.json({ 
@@ -1641,17 +2240,12 @@ app.post('/api/test-clockout', async (req, res) => {
       });
     }
     
-    // บันทึกเวลาออก
     const now = new Date().toISOString();
     
-    await getPool().query(
-      `UPDATE time_logs SET 
-      clock_out = $1, latitude_out = $2, longitude_out = $3
-      WHERE id = $4`,
-      [now, 13.7563 || null, 100.5018 || null, record.id]
-    );
+    await db.executePrepared('UPDATE_CLOCK_OUT', [
+      now, 13.7563 || null, 100.5018 || null, null, null, record.id
+    ]);
     
-    // ปรับเวลาเป็นเวลาไทย
     const utcTime = new Date(now);
     const thaiTime = new Date(utcTime.getTime() + (7 * 60 * 60 * 1000));
     const returnDate = thaiTime.toLocaleTimeString('th-TH');
@@ -1668,14 +2262,304 @@ app.post('/api/test-clockout', async (req, res) => {
   }
 });
 
-// API - ดึงข้อมูลบันทึกเวลาเฉพาะรายการ
+// server.js - Mobile Time Tracker Server (ส่วนที่ 7/8)
+// Health Check, Monitoring และ Error Handlers
+
+// ⭐ Health Check Endpoint สำหรับ Production Monitoring
+app.get('/health', async (req, res) => {
+  try {
+    // ตรวจสอบ database connection
+    const dbHealth = await db.healthCheck();
+    
+    // ตรวจสอบ memory usage
+    const memUsage = process.memoryUsage();
+    const memHealthy = memUsage.heapUsed < memUsage.heapTotal * 0.9; // < 90%
+    
+    const health = {
+      status: dbHealth.healthy && memHealthy ? 'healthy' : 'unhealthy',
+      timestamp: new Date().toISOString(),
+      uptime: Math.floor(process.uptime()),
+      memory: {
+        used: Math.round(memUsage.heapUsed / 1024 / 1024), // MB
+        total: Math.round(memUsage.heapTotal / 1024 / 1024), // MB
+        external: Math.round(memUsage.external / 1024 / 1024), // MB
+        healthy: memHealthy,
+        usage_percent: Math.round((memUsage.heapUsed / memUsage.heapTotal) * 100)
+      },
+      database: {
+        connected: dbHealth.healthy,
+        response_time: dbHealth.timestamp ? new Date(dbHealth.timestamp).getTime() - Date.now() : null,
+        ...dbHealth.poolInfo
+      },
+      environment: process.env.NODE_ENV || 'development',
+      version: '1.0.0',
+      timezone: process.env.TZ || 'Asia/Bangkok'
+    };
+    
+    const statusCode = health.status === 'healthy' ? 200 : 503;
+    res.status(statusCode).json(health);
+    
+  } catch (error) {
+    console.error('❌ Health check error:', error);
+    res.status(503).json({
+      status: 'unhealthy',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// ⭐ Metrics Endpoint สำหรับ Monitoring
+app.get('/metrics', async (req, res) => {
+  try {
+    const metrics = {
+      timestamp: new Date().toISOString(),
+      uptime: Math.floor(process.uptime()),
+      memory: process.memoryUsage(),
+      cpu: process.cpuUsage(),
+      platform: process.platform,
+      node_version: process.version,
+      environment: process.env.NODE_ENV || 'development'
+    };
+    
+    // เพิ่ม database metrics
+    if (db && db.pool) {
+      const poolStats = db.getPoolStats();
+      metrics.database = {
+        total_connections: poolStats.totalCount,
+        idle_connections: poolStats.idleCount,
+        waiting_requests: poolStats.waitingCount,
+        connected: poolStats.connected,
+        reconnect_attempts: poolStats.reconnectAttempts
+      };
+    }
+    
+    // เพิ่ม cache metrics
+    if (typeof employeeCache !== 'undefined') {
+      metrics.cache = {
+        employee_cache_size: employeeCache ? employeeCache.length : 0,
+        employee_cache_age: employeeCacheTime ? Date.now() - employeeCacheTime : 0,
+        api_cache_size: mobilePerf.apiCache.size,
+        api_cache_hit_rate: calculateCacheHitRate()
+      };
+    }
+    
+    // เพิ่ม request metrics
+    metrics.requests = {
+      total_processed: global.totalRequests || 0,
+      errors_count: global.errorCount || 0,
+      avg_response_time: global.avgResponseTime || 0
+    };
+    
+    res.json(metrics);
+    
+  } catch (error) {
+    console.error('❌ Metrics error:', error);
+    res.status(500).json({
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// ⭐ Request Logging สำหรับ Production
+if (process.env.NODE_ENV === 'production') {
+  // Initialize global counters
+  global.totalRequests = 0;
+  global.errorCount = 0;
+  global.totalResponseTime = 0;
+  global.avgResponseTime = 0;
+  
+  app.use((req, res, next) => {
+    const startTime = Date.now();
+    global.totalRequests++;
+    
+    // Override res.end to log response time
+    const originalEnd = res.end;
+    res.end = function(...args) {
+      const duration = Date.now() - startTime;
+      
+      // Update average response time
+      global.totalResponseTime += duration;
+      global.avgResponseTime = Math.round(global.totalResponseTime / global.totalRequests);
+      
+      // Log สำหรับ requests ที่ใช้เวลานาน
+      if (duration > 2000) {
+        console.warn(`🐌 Very Slow Request: ${req.method} ${req.url} - ${duration}ms - ${res.statusCode}`);
+      } else if (duration > 1000) {
+        console.log(`⚠️ Slow Request: ${req.method} ${req.url} - ${duration}ms - ${res.statusCode}`);
+      }
+      
+      // Log errors
+      if (res.statusCode >= 400) {
+        global.errorCount++;
+        console.log(`❌ Error Request: ${req.method} ${req.url} - ${res.statusCode} - ${duration}ms`);
+      }
+      
+      originalEnd.apply(res, args);
+    };
+    
+    next();
+  });
+}
+
+// ⭐ PWA Offline Fallback
+app.get('/offline.html', (req, res) => {
+  const offlineHtml = `
+    <!DOCTYPE html>
+    <html lang="th">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>ออฟไลน์ - ระบบลงเวลา</title>
+      <style>
+        body { 
+          font-family: 'Kanit', sans-serif; 
+          text-align: center; 
+          padding: 50px; 
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          color: white;
+          min-height: 100vh;
+          margin: 0;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex-direction: column;
+        }
+        .offline-container {
+          background: rgba(255,255,255,0.1);
+          padding: 40px;
+          border-radius: 20px;
+          backdrop-filter: blur(10px);
+          box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+        }
+        .offline-icon {
+          font-size: 64px;
+          margin-bottom: 20px;
+        }
+        .retry-btn {
+          background: #4CAF50;
+          color: white;
+          border: none;
+          padding: 15px 30px;
+          border-radius: 25px;
+          font-size: 16px;
+          cursor: pointer;
+          margin-top: 20px;
+          transition: all 0.3s ease;
+        }
+        .retry-btn:hover {
+          background: #45a049;
+          transform: translateY(-2px);
+        }
+      </style>
+    </head>
+    <body>
+      <div class="offline-container">
+        <div class="offline-icon">📱💔</div>
+        <h1>ไม่มีการเชื่อมต่ออินเทอร์เน็ต</h1>
+        <p>กรุณาตรวจสอบการเชื่อมต่ออินเทอร์เน็ตของคุณ</p>
+        <p>ข้อมูลจะถูกบันทึกไว้และส่งเมื่อมีการเชื่อมต่อ</p>
+        <button class="retry-btn" onclick="window.location.reload()">
+          🔄 ลองใหม่
+        </button>
+      </div>
+      <script>
+        // Auto-reload when online
+        window.addEventListener('online', () => {
+          window.location.reload();
+        });
+      </script>
+    </body>
+    </html>
+  `;
+  
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(offlineHtml);
+});
+
+// ⭐ Cleanup Function สำหรับ Memory Management
+function performCleanup() {
+  console.log('🧹 Performing periodic cleanup...');
+  
+  try {
+    // ล้าง API cache เก่า
+    if (mobilePerf && mobilePerf.apiCache) {
+      const now = Date.now();
+      const cacheSize = mobilePerf.apiCache.size;
+      
+      for (const [key, value] of mobilePerf.apiCache.entries()) {
+        if (now - value.timestamp > 300000) { // 5 minutes
+          mobilePerf.apiCache.delete(key);
+        }
+      }
+      
+      const newSize = mobilePerf.apiCache.size;
+      if (newSize < cacheSize) {
+        console.log(`🧹 Cleared ${cacheSize - newSize} expired API cache entries`);
+      }
+    }
+    
+    // ล้าง employee cache หากเก่าเกินไป
+    if (employeeCacheTime && (Date.now() - employeeCacheTime) > CACHE_DURATION * 2) {
+      clearEmployeeCache();
+      console.log('🧹 Cleared expired employee cache');
+    }
+    
+    // Force garbage collection ใน development
+    if (process.env.NODE_ENV === 'development' && global.gc) {
+      const beforeMem = process.memoryUsage().heapUsed;
+      global.gc();
+      const afterMem = process.memoryUsage().heapUsed;
+      const freed = Math.round((beforeMem - afterMem) / 1024 / 1024);
+      if (freed > 0) {
+        console.log(`🧹 Garbage collection freed ${freed}MB`);
+      }
+    }
+    
+  } catch (error) {
+    console.error('❌ Cleanup error:', error);
+  }
+}
+
+// รัน cleanup ทุก 10 นาที
+setInterval(performCleanup, 10 * 60 * 1000);
+
+// ⭐ Database Connection Monitoring
+if (db && db.pool) {
+  db.pool.on('connect', (client) => {
+    console.log('🔗 New database client connected');
+  });
+  
+  db.pool.on('error', (err) => {
+    console.error('❌ Database pool error:', err);
+    // ส่งแจ้งเตือนไปยัง monitoring service ถ้ามี
+  });
+  
+  db.pool.on('remove', (client) => {
+    console.log('🔌 Database client removed from pool');
+  });
+}
+
+// ⭐ Helper Functions
+function calculateCacheHitRate() {
+  // This would be implemented with actual cache hit/miss tracking
+  return 0; // Placeholder
+}
+
+// ⭐ Admin Routes (เก็บเป็นส่วนหลัง)
+app.get('/admin/*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', req.path));
+});
+
+// ⭐ Additional Admin APIs (เพิ่มเติม)
 app.get('/api/admin/time-logs/:id', async (req, res) => {
   console.log('API: admin/time-logs/:id - ดึงข้อมูลการลงเวลาเฉพาะรายการ', req.params);
   
   try {
     const { id } = req.params;
     
-    const result = await getPool().query(`
+    const result = await db.query(`
       SELECT t.id, t.employee_id, e.emp_code, e.full_name, e.position, e.department, 
              t.clock_in, t.clock_out, t.note, t.status
       FROM time_logs t
@@ -1688,7 +2572,6 @@ app.get('/api/admin/time-logs/:id', async (req, res) => {
     }
     
     const log = result.rows[0];
-    
     res.json({ success: true, log });
   } catch (error) {
     console.error('Error getting time log:', error);
@@ -1696,294 +2579,32 @@ app.get('/api/admin/time-logs/:id', async (req, res) => {
   }
 });
 
-// API - แก้ไขข้อมูลการลงเวลา
-app.put('/api/admin/time-logs/:id', async (req, res) => {
-  console.log('API: admin/time-logs/:id PUT - แก้ไขข้อมูลการลงเวลา', req.params, req.body);
+app.get('/api/admin/employees/:id', async (req, res) => {
+  console.log('API: admin/employees/:id - ดึงข้อมูลพนักงานเฉพาะรายการ', req.params);
   
   try {
     const { id } = req.params;
-    const { clock_in, clock_out, note } = req.body;
     
-    // ตรวจสอบว่ามีรายการนี้ในฐานข้อมูลหรือไม่
-    const checkResult = await getPool().query('SELECT id FROM time_logs WHERE id = $1', [id]);
+    const result = await db.query(`
+      SELECT id, emp_code, full_name, position, department, 
+             line_id, line_name, status, mobile_enabled, created_at
+      FROM employees
+      WHERE id = $1
+    `, [id]);
     
-    if (checkResult.rows.length === 0) {
-      return res.json({ success: false, message: 'ไม่พบข้อมูลการลงเวลา' });
-    }
-    
-    // ใช้ฟังก์ชันเดียวกันกับการเพิ่มข้อมูล
-    function processAdminDateTime(timeString) {
-      if (!timeString) return null;
-      
-      console.log('Processing admin edit time:', timeString);
-      
-      // datetime-local format จาก HTML input
-      if (timeString.includes('T') && !timeString.includes('Z') && !timeString.includes('+')) {
-        const localDateTime = timeString + ':00';
-        const localDate = new Date(localDateTime);
-        const utcDate = new Date(localDate.getTime() - (7 * 60 * 60 * 1000));
-        
-        console.log('Admin edit conversion:', timeString, '->', utcDate.toISOString());
-        return utcDate.toISOString();
-      }
-      
-      // มี timezone info แล้ว
-      if (timeString.includes('Z') || timeString.includes('+')) {
-        return new Date(timeString).toISOString();
-      }
-      
-      // กรณีอื่นๆ
-      const date = new Date(timeString);
-      const utcDate = new Date(date.getTime() - (7 * 60 * 60 * 1000));
-      return utcDate.toISOString();
-    }
-    
-    const adjustedClockIn = processAdminDateTime(clock_in);
-    const adjustedClockOut = clock_out ? processAdminDateTime(clock_out) : null;
-    
-    console.log('=== Admin Edit Time Processing ===');
-    console.log('Original times:', { clock_in, clock_out });
-    console.log('Processed times (UTC):', { 
-      clock_in: adjustedClockIn, 
-      clock_out: adjustedClockOut 
-    });
-    console.log('==================================');
-    
-    // แก้ไขข้อมูล
-    const updateQuery = `
-      UPDATE time_logs SET 
-      clock_in = $1, 
-      clock_out = $2, 
-      note = $3
-      WHERE id = $4
-    `;
-    
-    await getPool().query(updateQuery, [adjustedClockIn, adjustedClockOut, note, id]);
-    
-    console.log(`Updated time log ID: ${id}`);
-    res.json({ success: true, message: 'แก้ไขข้อมูลการลงเวลาเรียบร้อยแล้ว' });
-  } catch (error) {
-    console.error('Error updating time log:', error);
-    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
-  }
-});
-
-// API - เพิ่มข้อมูลการลงเวลาใหม่
-app.post('/api/admin/time-logs', async (req, res) => {
-  console.log('API: admin/time-logs POST - เพิ่มข้อมูลการลงเวลาใหม่', req.body);
-  
-  try {
-    const { employee_id, clock_in, clock_out, note, skip_notification } = req.body;
-    
-    if (!employee_id || !clock_in) {
-      return res.json({ success: false, message: 'กรุณาระบุข้อมูลที่จำเป็น' });
-    }
-    
-    // ตรวจสอบว่ามีพนักงานนี้ในระบบหรือไม่
-    const empResult = await getPool().query('SELECT id, full_name FROM employees WHERE id = $1', [employee_id]);
-    
-    if (empResult.rows.length === 0) {
+    if (result.rows.length === 0) {
       return res.json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
     }
     
-    const employee = empResult.rows[0];
-    
-    // ฟังก์ชันสำหรับจัดการเวลาจากแอดมิน
-    function processAdminDateTime(timeString) {
-      if (!timeString) return null;
-      
-      console.log('Processing admin time input:', timeString);
-      
-      // ถ้าเป็น datetime-local format จาก HTML input (YYYY-MM-DDTHH:MM)
-      if (timeString.includes('T') && !timeString.includes('Z') && !timeString.includes('+')) {
-        // ถือว่าเป็นเวลาไทยที่ป้อนเข้ามา ไม่ต้องปรับ timezone
-        // แค่เพิ่ม :00 สำหรับวินาทีและแปลงเป็น UTC
-        const localDateTime = timeString + ':00'; // YYYY-MM-DDTHH:MM:SS
-        const localDate = new Date(localDateTime);
-        
-        // แปลงเป็น UTC โดยลบ 7 ชั่วโมง (เพราะไทยเป็น UTC+7)
-        const utcDate = new Date(localDate.getTime() - (7 * 60 * 60 * 1000));
-        
-        console.log('Admin input conversion:');
-        console.log('  Input:', timeString);
-        console.log('  Local with seconds:', localDateTime);
-        console.log('  Local Date object:', localDate.toString());
-        console.log('  UTC Date object:', utcDate.toString());
-        console.log('  Final UTC ISO:', utcDate.toISOString());
-        
-        return utcDate.toISOString();
-      }
-      
-      // ถ้ามี timezone info แล้ว ใช้ตามนั้น
-      if (timeString.includes('Z') || timeString.includes('+')) {
-        const result = new Date(timeString).toISOString();
-        console.log('Already has timezone info:', timeString, '->', result);
-        return result;
-      }
-      
-      // กรณีอื่นๆ ถือว่าเป็นเวลาไทยและแปลงเป็น UTC
-      const date = new Date(timeString);
-      const utcDate = new Date(date.getTime() - (7 * 60 * 60 * 1000));
-      console.log('Other format conversion:', timeString, '->', utcDate.toISOString());
-      return utcDate.toISOString();
-    }
-    
-    // แปลงเวลาให้เป็น UTC
-    const adjustedClockIn = processAdminDateTime(clock_in);
-    const adjustedClockOut = clock_out ? processAdminDateTime(clock_out) : null;
-    
-    console.log('=== Admin Time Processing ===');
-    console.log('Original clock_in:', clock_in);
-    console.log('Processed clock_in (UTC):', adjustedClockIn);
-    
-    if (clock_out) {
-      console.log('Original clock_out:', clock_out);
-      console.log('Processed clock_out (UTC):', adjustedClockOut);
-    }
-    
-    // ตรวจสอบผลลัพธ์การแปลงเวลา
-    const testThaiTime = new Date(adjustedClockIn);
-    const displayThaiTime = new Date(testThaiTime.getTime() + (7 * 60 * 60 * 1000));
-    console.log('Will display as Thai time:', displayThaiTime.toLocaleString('th-TH'));
-    console.log('==============================');
-    
-    // เพิ่มข้อมูลการลงเวลา
-    const insertQuery = `
-      INSERT INTO time_logs (employee_id, clock_in, clock_out, note, status)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING id
-    `;
-    
-    const result = await getPool().query(insertQuery, [
-      employee_id, 
-      adjustedClockIn, 
-      adjustedClockOut, 
-      note || null,
-      'manual' // สถานะ manual สำหรับข้อมูลที่เพิ่มโดยแอดมิน
-    ]);
-    
-    const newId = result.rows[0].id;
-    
-    // ส่งแจ้งเตือนถ้าไม่ได้ข้ามการแจ้งเตือน
-    if (!skip_notification) {
-      const notifySettingResult = await getPool().query(
-        'SELECT setting_value FROM settings WHERE setting_name = $1',
-        ['notify_clock_in']
-      );
-      
-      if (notifySettingResult.rows.length > 0 && notifySettingResult.rows[0].setting_value === '1') {
-        // ใช้เวลาไทยสำหรับการแจ้งเตือน
-        const clockInForNotify = new Date(adjustedClockIn);
-        const thaiTimeForNotify = new Date(clockInForNotify.getTime() + (7 * 60 * 60 * 1000));
-        
-        const thaiFormatter = new Intl.DateTimeFormat('th-TH', {
-          year: 'numeric',
-          month: 'long',
-          day: 'numeric',
-          weekday: 'long'
-        });
-        const thaiDate = thaiFormatter.format(thaiTimeForNotify);
-        const timeStr = thaiTimeForNotify.toLocaleTimeString('th-TH');
-        
-        let message =
-          `⏱ ลงเวลาเข้างาน (บันทึกโดยแอดมิน)\n` +
-          `👤 ชื่อ-นามสกุล: *${employee.full_name}*\n` +
-          `📅 วันที่: *${thaiDate}*\n` +
-          `🕒 เวลา: *${timeStr}*\n` +
-          (note ? `📝 หมายเหตุ: *${note}*\n` : "");
-        
-        // ส่งแจ้งเตือน
-        await sendTelegramToAllGroups(message, null, null, employee.full_name);
-      }
-      
-      // ถ้ามีการลงเวลาออกด้วย
-      if (adjustedClockOut) {
-        const notifyOutSettingResult = await getPool().query(
-          'SELECT setting_value FROM settings WHERE setting_name = $1',
-          ['notify_clock_out']
-        );
-        
-        if (notifyOutSettingResult.rows.length > 0 && notifyOutSettingResult.rows[0].setting_value === '1') {
-          const clockOutForNotify = new Date(adjustedClockOut);
-          const thaiTimeForNotify = new Date(clockOutForNotify.getTime() + (7 * 60 * 60 * 1000));
-          
-          const thaiFormatter = new Intl.DateTimeFormat('th-TH', {
-            year: 'numeric',
-            month: 'long',
-            day: 'numeric',
-            weekday: 'long'
-          });
-          const thaiDate = thaiFormatter.format(thaiTimeForNotify);
-          const timeStr = thaiTimeForNotify.toLocaleTimeString('th-TH');
-          
-          let message =
-            `⏱ ลงเวลาออกงาน (บันทึกโดยแอดมิน)\n` +
-            `👤 ชื่อ-นามสกุล: *${employee.full_name}*\n` +
-            `📅 วันที่: *${thaiDate}*\n` +
-            `🕒 เวลา: *${timeStr}*\n`;
-          
-          // ส่งแจ้งเตือน
-          await sendTelegramToAllGroups(message, null, null, employee.full_name);
-        }
-      }
-    }
-    
-    console.log(`Added new time log with ID: ${newId}`);
-    res.json({ success: true, message: 'เพิ่มข้อมูลการลงเวลาเรียบร้อยแล้ว', id: newId });
+    const employee = result.rows[0];
+    res.json({ success: true, employee });
   } catch (error) {
-    console.error('Error adding time log:', error);
+    console.error('Error getting employee:', error);
     res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
   }
 });
 
-// API - ลบข้อมูลการลงเวลา
-app.delete('/api/admin/time-logs/:id', async (req, res) => {
-  console.log('API: admin/time-logs/:id DELETE - ลบข้อมูลการลงเวลา', req.params);
-  
-  try {
-    const { id } = req.params;
-    
-    // ตรวจสอบว่ามีรายการนี้ในฐานข้อมูลหรือไม่
-    const checkResult = await getPool().query('SELECT id FROM time_logs WHERE id = $1', [id]);
-    
-    if (checkResult.rows.length === 0) {
-      return res.json({ success: false, message: 'ไม่พบข้อมูลการลงเวลา' });
-    }
-    
-    // ลบข้อมูล
-    await getPool().query('DELETE FROM time_logs WHERE id = $1', [id]);
-    
-    console.log(`Deleted time log ID: ${id}`);
-    res.json({ success: true, message: 'ลบข้อมูลการลงเวลาเรียบร้อยแล้ว' });
-  } catch (error) {
-    console.error('Error deleting time log:', error);
-    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
-  }
-});
-
-// เพิ่ม API สำหรับดึงค่าชดเชยเวลา
-app.get('/api/getTimeOffset', async (req, res) => {
-  console.log('API: getTimeOffset - ดึงค่าชดเชยเวลา');
-  
-  try {
-    const result = await getPool().query(
-      'SELECT setting_value FROM settings WHERE setting_name = $1',
-      ['time_offset']
-    );
-    
-    if (result.rows.length > 0) {
-      return res.json({ success: true, time_offset: result.rows[0].setting_value });
-    } else {
-      // ถ้าไม่พบค่าชดเชยเวลาในฐานข้อมูล ให้ใช้ค่าเริ่มต้น
-      return res.json({ success: true, time_offset: 420 }); // ตั้งค่าเริ่มต้นเป็น 7 ชั่วโมง (420 นาที)
-    }
-  } catch (error) {
-    console.error('Error getting time offset:', error);
-    return res.json({ success: false, error: error.message });
-  }
-});
-
-// API - นำเข้ารายชื่อพนักงานจาก Excel/CSV
+// ⭐ Admin - Import/Export APIs
 app.post('/api/admin/import-employees', async (req, res) => {
   console.log('API: admin/import-employees - นำเข้ารายชื่อพนักงานจากไฟล์', req.body);
   
@@ -2004,7 +2625,6 @@ app.post('/api/admin/import-employees', async (req, res) => {
       }
     }
     
-    // เตรียมข้อมูลสำหรับส่งกลับ
     const result = {
       success: true,
       total: employees.length,
@@ -2013,12 +2633,7 @@ app.post('/api/admin/import-employees', async (req, res) => {
       errors: []
     };
     
-    // เริ่มการนำเข้าข้อมูล
-    const client = await pool.connect();
-    
-    try {
-      await client.query('BEGIN');
-      
+    await db.withTransaction(async (client) => {
       for (const emp of employees) {
         try {
           // ตรวจสอบว่ามีรหัสพนักงานนี้ในระบบแล้วหรือไม่
@@ -2028,49 +2643,45 @@ app.post('/api/admin/import-employees', async (req, res) => {
           );
           
           if (checkResult.rows.length > 0) {
-            // ถ้ามีรหัสพนักงานนี้แล้ว
             if (skipExisting) {
-              // ข้ามรายการนี้ถ้าตั้งค่าให้ข้าม
               result.skipped++;
               continue;
             } else {
-              // อัปเดตข้อมูลพนักงานถ้าไม่ข้าม
+              // อัปเดตข้อมูลพนักงาน
               await client.query(
                 `UPDATE employees 
-                 SET full_name = $1, position = $2, department = $3, status = $4
-                 WHERE emp_code = $5`,
+                 SET full_name = $1, position = $2, department = $3, status = $4, mobile_enabled = $5
+                 WHERE emp_code = $6`,
                 [
                   emp.full_name,
                   emp.position || null,
                   emp.department || null,
                   emp.status || 'active',
+                  emp.mobile_enabled !== undefined ? emp.mobile_enabled : true,
                   emp.emp_code
                 ]
               );
-              
               result.imported++;
             }
           } else {
             // เพิ่มพนักงานใหม่
             await client.query(
               `INSERT INTO employees 
-               (emp_code, full_name, position, department, status)
-               VALUES ($1, $2, $3, $4, $5)`,
+               (emp_code, full_name, position, department, status, mobile_enabled)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
               [
                 emp.emp_code,
                 emp.full_name,
                 emp.position || null,
                 emp.department || null,
-                emp.status || 'active'
+                emp.status || 'active',
+                emp.mobile_enabled !== undefined ? emp.mobile_enabled : true
               ]
             );
-            
             result.imported++;
           }
         } catch (error) {
           console.error('Error importing employee:', emp, error);
-          
-          // เก็บข้อผิดพลาดสำหรับรายการนี้
           result.errors.push({
             emp_code: emp.emp_code,
             full_name: emp.full_name,
@@ -2078,21 +2689,10 @@ app.post('/api/admin/import-employees', async (req, res) => {
           });
         }
       }
-      
-      // บันทึกการเปลี่ยนแปลงทั้งหมด
-      await client.query('COMMIT');
-      
-    } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Error in transaction:', error);
-      
-      return res.json({
-        success: false,
-        message: 'เกิดข้อผิดพลาดในการนำเข้าข้อมูล: ' + error.message
-      });
-    } finally {
-      client.release();
-    }
+    });
+    
+    // ล้าง cache
+    clearEmployeeCache();
     
     console.log('Import result:', result);
     res.json(result);
@@ -2105,298 +2705,6 @@ app.post('/api/admin/import-employees', async (req, res) => {
   }
 });
 
-// API - เคลียร์ข้อมูลประวัติการลงเวลาตามช่วงเวลา
-app.post('/api/admin/cleanup-time-logs', async (req, res) => {
-  console.log('API: admin/cleanup-time-logs - เคลียร์ข้อมูลประวัติการลงเวลา', req.body);
-  
-  try {
-    const { date_before, employee_id, export_before_delete, cleanup_type } = req.body;
-    
-    if (!date_before && !cleanup_type) {
-      return res.json({ success: false, message: 'กรุณาระบุข้อมูลสำหรับการลบ เช่น วันที่หรือประเภทการลบ' });
-    }
-    
-    let query = 'SELECT t.id, t.employee_id, e.emp_code, e.full_name, t.clock_in, t.clock_out, t.note, t.status FROM time_logs t JOIN employees e ON t.employee_id = e.id WHERE 1=1';
-    const params = [];
-    let paramIndex = 1;
-    
-    // เงื่อนไขตามช่วงเวลา
-    if (date_before) {
-      query += ` AND DATE(t.clock_in) < $${paramIndex++}`;
-      params.push(date_before);
-    }
-    
-    // เงื่อนไขตามพนักงาน
-    if (employee_id) {
-      query += ` AND t.employee_id = $${paramIndex++}`;
-      params.push(employee_id);
-    }
-    
-    // เงื่อนไขตามประเภทการลบ
-    if (cleanup_type === 'last_month') {
-      // ลบข้อมูลเดือนที่แล้ว
-      const lastMonthDate = new Date();
-      lastMonthDate.setMonth(lastMonthDate.getMonth() - 1);
-      const firstDayLastMonth = new Date(lastMonthDate.getFullYear(), lastMonthDate.getMonth(), 1);
-      const lastDayLastMonth = new Date(lastMonthDate.getFullYear(), lastMonthDate.getMonth() + 1, 0);
-      
-      query += ` AND DATE(t.clock_in) >= $${paramIndex++} AND DATE(t.clock_in) <= $${paramIndex++}`;
-      params.push(firstDayLastMonth.toISOString().split('T')[0]);
-      params.push(lastDayLastMonth.toISOString().split('T')[0]);
-      
-    } else if (cleanup_type === 'last_year') {
-      // ลบข้อมูลปีที่แล้ว
-      const lastYearDate = new Date();
-      lastYearDate.setFullYear(lastYearDate.getFullYear() - 1);
-      const firstDayLastYear = new Date(lastYearDate.getFullYear(), 0, 1);
-      const lastDayLastYear = new Date(lastYearDate.getFullYear(), 11, 31);
-      
-      query += ` AND DATE(t.clock_in) >= $${paramIndex++} AND DATE(t.clock_in) <= $${paramIndex++}`;
-      params.push(firstDayLastYear.toISOString().split('T')[0]);
-      params.push(lastDayLastYear.toISOString().split('T')[0]);
-      
-    } else if (cleanup_type === 'older_than_6_months') {
-      // ลบข้อมูลเก่ากว่า 6 เดือน
-      const sixMonthsAgo = new Date();
-      sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-      
-      query += ` AND DATE(t.clock_in) < $${paramIndex++}`;
-      params.push(sixMonthsAgo.toISOString().split('T')[0]);
-      
-    } else if (cleanup_type === 'older_than_1_year') {
-      // ลบข้อมูลเก่ากว่า 1 ปี
-      const oneYearAgo = new Date();
-      oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
-      
-      query += ` AND DATE(t.clock_in) < $${paramIndex++}`;
-      params.push(oneYearAgo.toISOString().split('T')[0]);
-    }
-    
-    query += ' ORDER BY t.clock_in DESC';
-    
-    // ดึงข้อมูลที่จะลบ
-    const dataToDelete = await getPool().query(query, params);
-    
-    // ถ้าไม่มีข้อมูลที่ตรงเงื่อนไข
-    if (dataToDelete.rows.length === 0) {
-      return res.json({ success: false, message: 'ไม่พบข้อมูลที่ตรงตามเงื่อนไข' });
-    }
-    
-    // ส่งออกข้อมูลก่อนลบถ้าต้องการ
-    let exportData = null;
-    if (export_before_delete) {
-      exportData = dataToDelete.rows.map(row => {
-        const clockInDate = new Date(new Date(row.clock_in).getTime() + (7 * 60 * 60 * 1000));
-        const clockOutDate = row.clock_out ? new Date(new Date(row.clock_out).getTime() + (7 * 60 * 60 * 1000)) : null;
-        
-        return {
-          emp_code: row.emp_code,
-          full_name: row.full_name,
-          clock_in_date: clockInDate.toLocaleDateString('th-TH'),
-          clock_in_time: clockInDate.toLocaleTimeString('th-TH'),
-          clock_out_date: clockOutDate ? clockOutDate.toLocaleDateString('th-TH') : '',
-          clock_out_time: clockOutDate ? clockOutDate.toLocaleTimeString('th-TH') : '',
-          note: row.note || '',
-          status: row.status
-        };
-      });
-    }
-    
-    // ลบข้อมูล
-    const idsToDelete = dataToDelete.rows.map(row => row.id);
-    
-    // ใช้ IN clause สำหรับการลบ (สำหรับข้อมูลจำนวนมาก ควรแบ่งชุดละไม่เกิน 1000 รายการ)
-    const batchSize = 1000;
-    const totalRecords = idsToDelete.length;
-    let deletedCount = 0;
-    
-    for (let i = 0; i < totalRecords; i += batchSize) {
-      const batch = idsToDelete.slice(i, i + batchSize);
-      
-      // สร้าง placeholders สำหรับ IN clause
-      const placeholders = batch.map((_, idx) => `$${idx + 1}`).join(', ');
-      
-      // ลบข้อมูลในแต่ละชุด
-      const deleteResult = await getPool().query(
-        `DELETE FROM time_logs WHERE id IN (${placeholders})`,
-        batch
-      );
-      
-      deletedCount += deleteResult.rowCount;
-    }
-    
-    console.log(`ลบข้อมูลทั้งหมด ${deletedCount} รายการ`);
-    
-    // ส่งผลลัพธ์กลับ
-    res.json({
-      success: true,
-      message: `ลบข้อมูลเรียบร้อยแล้ว ${deletedCount} รายการ`,
-      deleted_count: deletedCount,
-      export_data: exportData
-    });
-    
-  } catch (error) {
-    console.error('Error cleaning up time logs:', error);
-    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
-  }
-});
-
-// API - ล้างข้อมูลพนักงานที่ไม่ได้ใช้งาน
-app.post('/api/admin/cleanup-inactive-employees', async (req, res) => {
-  console.log('API: admin/cleanup-inactive-employees - ล้างข้อมูลพนักงานที่ไม่ได้ใช้งาน', req.body);
-  
-  try {
-    const { include_logs, export_before_delete } = req.body;
-    
-    // ค้นหาพนักงานที่มีสถานะไม่ใช้งาน
-    const inactiveEmployees = await getPool().query(
-      'SELECT id, emp_code, full_name FROM employees WHERE status = $1',
-      ['inactive']
-    );
-    
-    if (inactiveEmployees.rows.length === 0) {
-      return res.json({ success: false, message: 'ไม่พบพนักงานที่มีสถานะไม่ใช้งาน' });
-    }
-    
-    // ส่งออกข้อมูลก่อนลบถ้าต้องการ
-    let exportData = null;
-    if (export_before_delete) {
-      exportData = {
-        employees: inactiveEmployees.rows.map(emp => ({
-          id: emp.id,
-          emp_code: emp.emp_code,
-          full_name: emp.full_name
-        }))
-      };
-      
-      // ถ้าต้องการส่งออกข้อมูลการลงเวลาด้วย
-      if (include_logs) {
-        const employeeIds = inactiveEmployees.rows.map(emp => emp.id);
-        const placeholders = employeeIds.map((_, idx) => `$${idx + 1}`).join(', ');
-        
-        const timeLogs = await getPool().query(
-          `SELECT t.id, t.employee_id, e.emp_code, e.full_name, t.clock_in, t.clock_out, t.note 
-           FROM time_logs t 
-           JOIN employees e ON t.employee_id = e.id 
-           WHERE t.employee_id IN (${placeholders})
-           ORDER BY t.clock_in DESC`,
-          employeeIds
-        );
-        
-        exportData.time_logs = timeLogs.rows.map(log => {
-          const clockInDate = new Date(new Date(log.clock_in).getTime() + (7 * 60 * 60 * 1000));
-          const clockOutDate = log.clock_out ? new Date(new Date(log.clock_out).getTime() + (7 * 60 * 60 * 1000)) : null;
-          
-          return {
-            id: log.id,
-            emp_code: log.emp_code,
-            full_name: log.full_name,
-            clock_in_date: clockInDate.toLocaleDateString('th-TH'),
-            clock_in_time: clockInDate.toLocaleTimeString('th-TH'),
-            clock_out_date: clockOutDate ? clockOutDate.toLocaleDateString('th-TH') : '',
-            clock_out_time: clockOutDate ? clockOutDate.toLocaleTimeString('th-TH') : '',
-            note: log.note || ''
-          };
-        });
-      }
-    }
-    
-    const client = await pool.connect();
-    
-    try {
-      await client.query('BEGIN');
-      
-      let deletedLogCount = 0;
-      
-      // ลบข้อมูลการลงเวลาของพนักงานที่ไม่ใช้งานถ้าต้องการ
-      if (include_logs) {
-        const employeeIds = inactiveEmployees.rows.map(emp => emp.id);
-        
-        // แบ่งเป็นชุดเพื่อป้องกันปัญหากับข้อมูลจำนวนมาก
-        const batchSize = 100;
-        
-        for (let i = 0; i < employeeIds.length; i += batchSize) {
-          const batchIds = employeeIds.slice(i, i + batchSize);
-          const placeholders = batchIds.map((_, idx) => `$${idx + 1}`).join(', ');
-          
-          const deleteLogsResult = await client.query(
-            `DELETE FROM time_logs WHERE employee_id IN (${placeholders})`,
-            batchIds
-          );
-          
-          deletedLogCount += deleteLogsResult.rowCount;
-        }
-      }
-      
-      // ลบข้อมูลพนักงานที่ไม่ใช้งาน
-      const employeeIds = inactiveEmployees.rows.map(emp => emp.id);
-      const placeholders = employeeIds.map((_, idx) => `$${idx + 1}`).join(', ');
-      
-      const deleteEmployeesResult = await client.query(
-        `DELETE FROM employees WHERE id IN (${placeholders})`,
-        employeeIds
-      );
-      
-      await client.query('COMMIT');
-      
-      console.log(`ลบพนักงานทั้งหมด ${deleteEmployeesResult.rowCount} คน และข้อมูลการลงเวลา ${deletedLogCount} รายการ`);
-      
-      // ส่งผลลัพธ์กลับ
-      res.json({
-        success: true,
-        message: `ลบพนักงานเรียบร้อยแล้ว ${deleteEmployeesResult.rowCount} คน และข้อมูลการลงเวลา ${deletedLogCount} รายการ`,
-        deleted_employees: deleteEmployeesResult.rowCount,
-        deleted_logs: deletedLogCount,
-        export_data: exportData
-      });
-      
-    } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Error cleaning up inactive employees:', error);
-      res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
-    } finally {
-      client.release();
-    }
-    
-  } catch (error) {
-    console.error('Error cleaning up inactive employees:', error);
-    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
-  }
-});
-
-// API - สำรองข้อมูลไฟล์ฐานข้อมูล (สำหรับระบบ PostgreSQL บน Render.com ควรใช้วิธีสำรองผ่าน dashboard ของ Render)
-app.get('/api/admin/backup-database', async (req, res) => {
-  console.log('API: admin/backup-database - สำรองข้อมูลฐานข้อมูล');
-  
-  try {
-    // ดึงข้อมูลทั้งหมดจากตาราง employees และ time_logs
-    const employeesResult = await getPool().query('SELECT * FROM employees ORDER BY id');
-    const timeLogsResult = await getPool().query('SELECT * FROM time_logs ORDER BY id');
-    const settingsResult = await getPool().query('SELECT * FROM settings ORDER BY id');
-    
-    // สร้าง object ข้อมูลสำรอง
-    const backupData = {
-      timestamp: new Date().toISOString(),
-      employees: employeesResult.rows,
-      time_logs: timeLogsResult.rows,
-      settings: settingsResult.rows.filter(s => s.setting_name !== 'admin_password') // ไม่รวมรหัสผ่านในข้อมูลสำรอง
-    };
-    
-    // แปลงเป็น JSON
-    const backupJSON = JSON.stringify(backupData, null, 2);
-    
-    // ส่งไฟล์ JSON กลับไปยังผู้ใช้
-    res.setHeader('Content-Disposition', `attachment; filename=time_tracker_backup_${new Date().toISOString().split('T')[0]}.json`);
-    res.setHeader('Content-Type', 'application/json');
-    res.send(backupJSON);
-    
-  } catch (error) {
-    console.error('Error backing up database:', error);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
-  }
-});
-
-// API - ส่งออกข้อมูลการลงเวลาเป็น CSV
 app.post('/api/admin/export-time-logs', async (req, res) => {
   console.log('API: admin/export-time-logs - ส่งออกข้อมูลการลงเวลา', req.body);
   
@@ -2416,23 +2724,23 @@ app.post('/api/admin/export-time-logs', async (req, res) => {
     let paramIndex = 1;
     
     if (from_date) {
-      query += ` AND DATE(t.clock_in) >= $${paramIndex++}`;
+      query += ` AND DATE(t.clock_in) >= ${paramIndex++}`;
       params.push(from_date);
     }
     
     if (to_date) {
-      query += ` AND DATE(t.clock_in) <= $${paramIndex++}`;
+      query += ` AND DATE(t.clock_in) <= ${paramIndex++}`;
       params.push(to_date);
     }
     
     if (employee_id) {
-      query += ` AND t.employee_id = $${paramIndex++}`;
+      query += ` AND t.employee_id = ${paramIndex++}`;
       params.push(employee_id);
     }
     
     query += ' ORDER BY t.clock_in DESC';
     
-    const result = await getPool().query(query, params);
+    const result = await db.query(query, params);
     
     if (result.rows.length === 0) {
       return res.json({ success: false, message: 'ไม่พบข้อมูลที่ตรงตามเงื่อนไข' });
@@ -2459,7 +2767,6 @@ app.post('/api/admin/export-time-logs', async (req, res) => {
       };
     });
     
-    // ส่งข้อมูลกลับในรูปแบบที่ต้องการ
     res.json({
       success: true,
       data: formattedLogs,
@@ -2472,190 +2779,329 @@ app.post('/api/admin/export-time-logs', async (req, res) => {
   }
 });
 
-// API - ลบพนักงานทั้งหมด
-app.post('/api/admin/delete-all-employees', async (req, res) => {
-  console.log('API: admin/delete-all-employees - ลบพนักงานทั้งหมด', req.body);
+// ⭐ Admin - Database Backup
+app.get('/api/admin/backup-database', async (req, res) => {
+  console.log('API: admin/backup-database - สำรองข้อมูลฐานข้อมูล');
   
   try {
-    const { confirm } = req.body;
+    const employeesResult = await db.query('SELECT * FROM employees ORDER BY id');
+    const timeLogsResult = await db.query('SELECT * FROM time_logs ORDER BY id');
+    const settingsResult = await db.query('SELECT * FROM settings ORDER BY id');
     
-    if (!confirm) {
-      return res.json({ success: false, message: 'ต้องยืนยันการลบข้อมูล' });
-    }
+    // สร้าง object ข้อมูลสำรอง
+    const backupData = {
+      timestamp: new Date().toISOString(),
+      version: '1.0.0',
+      employees: employeesResult.rows,
+      time_logs: timeLogsResult.rows,
+      settings: settingsResult.rows.filter(s => s.setting_name !== 'admin_password') // ไม่รวมรหัสผ่าน
+    };
     
-    const client = await pool.connect();
+    // แปลงเป็น JSON
+    const backupJSON = JSON.stringify(backupData, null, 2);
     
-    try {
-      await client.query('BEGIN');
-      
-      // ลบข้อมูลการลงเวลาทั้งหมดก่อน เนื่องจากมี foreign key
-      const deleteLogsResult = await client.query('DELETE FROM time_logs');
-      
-      // ลบข้อมูลพนักงานทั้งหมด
-      const deleteEmployeesResult = await client.query('DELETE FROM employees');
-      
-      await client.query('COMMIT');
-      
-      console.log(`ลบพนักงานทั้งหมด ${deleteEmployeesResult.rowCount} คน และข้อมูลการลงเวลา ${deleteLogsResult.rowCount} รายการ`);
-      
-      res.json({
-        success: true,
-        message: 'ลบพนักงานทั้งหมดเรียบร้อยแล้ว',
-        deleted_count: deleteEmployeesResult.rowCount,
-        deleted_logs: deleteLogsResult.rowCount
-      });
-      
-    } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Error deleting all employees:', error);
-      res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
-    } finally {
-      client.release();
-    }
+    // ส่งไฟล์ JSON กลับไปยังผู้ใช้
+    res.setHeader('Content-Disposition', `attachment; filename=time_tracker_backup_${new Date().toISOString().split('T')[0]}.json`);
+    res.setHeader('Content-Type', 'application/json');
+    res.send(backupJSON);
     
   } catch (error) {
-    console.error('Error deleting all employees:', error);
-    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
+    console.error('Error backing up database:', error);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
   }
 });
 
-// API - ดึงข้อมูลพนักงานเฉพาะรายการ
-app.get('/api/admin/employees/:id', async (req, res) => {
-  console.log('API: admin/employees/:id - ดึงข้อมูลพนักงานเฉพาะรายการ', req.params);
+// ⭐ Admin - Cleanup APIs
+app.post('/api/admin/cleanup-time-logs', async (req, res) => {
+  console.log('API: admin/cleanup-time-logs - เคลียร์ข้อมูลประวัติการลงเวลา', req.body);
   
   try {
-    const { id } = req.params;
+    const { date_before, employee_id, export_before_delete, cleanup_type } = req.body;
     
-    const result = await getPool().query(`
-      SELECT id, emp_code, full_name, position, department, 
-             line_id, line_name, status, created_at
-      FROM employees
-      WHERE id = $1
-    `, [id]);
-    
-    if (result.rows.length === 0) {
-      return res.json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+    if (!date_before && !cleanup_type) {
+      return res.json({ success: false, message: 'กรุณาระบุข้อมูลสำหรับการลบ' });
     }
     
-    const employee = result.rows[0];
+    let query = 'SELECT t.id FROM time_logs t JOIN employees e ON t.employee_id = e.id WHERE 1=1';
+    const params = [];
+    let paramIndex = 1;
     
-    res.json({ success: true, employee });
-  } catch (error) {
-    console.error('Error getting employee:', error);
-    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
-  }
-});
-
-// API - แก้ไขข้อมูลพนักงาน
-app.put('/api/admin/employees/:id', async (req, res) => {
-  console.log('API: admin/employees/:id PUT - แก้ไขข้อมูลพนักงาน', req.params, req.body);
-  
-  try {
-    const { id } = req.params;
-    const { emp_code, full_name, position, department, status } = req.body;
-    
-    if (!emp_code || !full_name) {
-      return res.json({ success: false, message: 'กรุณาระบุรหัสพนักงานและชื่อ-นามสกุล' });
+    // เงื่อนไขตามช่วงเวลา
+    if (date_before) {
+      query += ` AND DATE(t.clock_in) < ${paramIndex++}`;
+      params.push(date_before);
     }
     
-    // ตรวจสอบว่ามีพนักงานนี้ในระบบหรือไม่
-    const checkResult = await getPool().query('SELECT id FROM employees WHERE id = $1', [id]);
-    
-    if (checkResult.rows.length === 0) {
-      return res.json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+    if (employee_id) {
+      query += ` AND t.employee_id = ${paramIndex++}`;
+      params.push(employee_id);
     }
     
-    // ตรวจสอบว่ารหัสพนักงานซ้ำกับคนอื่นหรือไม่ (ยกเว้นตัวเอง)
-    const duplicateResult = await getPool().query(
-      'SELECT id FROM employees WHERE emp_code = $1 AND id != $2',
-      [emp_code, id]
-    );
-    
-    if (duplicateResult.rows.length > 0) {
-      return res.json({ success: false, message: 'รหัสพนักงานนี้มีอยู่ในระบบแล้ว' });
+    // เงื่อนไขตามประเภทการลบ
+    if (cleanup_type === 'older_than_6_months') {
+      const sixMonthsAgo = new Date();
+      sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+      query += ` AND DATE(t.clock_in) < ${paramIndex++}`;
+      params.push(sixMonthsAgo.toISOString().split('T')[0]);
+    } else if (cleanup_type === 'older_than_1_year') {
+      const oneYearAgo = new Date();
+      oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+      query += ` AND DATE(t.clock_in) < ${paramIndex++}`;
+      params.push(oneYearAgo.toISOString().split('T')[0]);
     }
     
-    // แก้ไขข้อมูลพนักงาน
-    const updateQuery = `
-      UPDATE employees SET 
-      emp_code = $1, 
-      full_name = $2, 
-      position = $3, 
-      department = $4,
-      status = $5
-      WHERE id = $6
-    `;
+    const dataToDelete = await db.query(query, params);
     
-    await getPool().query(updateQuery, [
-      emp_code, 
-      full_name, 
-      position || null, 
-      department || null,
-      status || 'active',
-      id
-    ]);
-    
-    console.log(`แก้ไขข้อมูลพนักงาน ID: ${id} เรียบร้อยแล้ว`);
-    res.json({ success: true, message: 'แก้ไขข้อมูลพนักงานเรียบร้อยแล้ว' });
-    
-  } catch (error) {
-    console.error('Error updating employee:', error);
-    res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
-  }
-});
-
-// API - เพิ่มพนักงานใหม่
-app.post('/api/admin/employees', async (req, res) => {
-  console.log('API: admin/employees POST - เพิ่มพนักงานใหม่', req.body);
-  
-  try {
-    const { emp_code, full_name, position, department } = req.body;
-    
-    if (!emp_code || !full_name) {
-      return res.json({ success: false, message: 'กรุณาระบุรหัสพนักงานและชื่อ-นามสกุล' });
+    if (dataToDelete.rows.length === 0) {
+      return res.json({ success: false, message: 'ไม่พบข้อมูลที่ตรงเงื่อนไข' });
     }
     
-    // ตรวจสอบว่ามีรหัสพนักงานซ้ำหรือไม่
-    const checkResult = await getPool().query(
-      'SELECT id FROM employees WHERE emp_code = $1',
-      [emp_code]
-    );
+    // ลบข้อมูล
+    const idsToDelete = dataToDelete.rows.map(row => row.id);
+    let deletedCount = 0;
     
-    if (checkResult.rows.length > 0) {
-      return res.json({ success: false, message: 'รหัสพนักงานนี้มีอยู่ในระบบแล้ว' });
+    // แบ่งเป็นชุดๆ ลบ
+    const batchSize = 1000;
+    for (let i = 0; i < idsToDelete.length; i += batchSize) {
+      const batch = idsToDelete.slice(i, i + batchSize);
+      const placeholders = batch.map((_, idx) => `${idx + 1}`).join(', ');
+      
+      const deleteResult = await db.query(
+        `DELETE FROM time_logs WHERE id IN (${placeholders})`,
+        batch
+      );
+      
+      deletedCount += deleteResult.rowCount;
     }
     
-    // เพิ่มพนักงานใหม่
-    const insertResult = await getPool().query(
-      `INSERT INTO employees (emp_code, full_name, position, department, status)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id`,
-      [emp_code, full_name, position || null, department || null, 'active']
-    );
+    console.log(`ลบข้อมูลทั้งหมด ${deletedCount} รายการ`);
     
-    const newId = insertResult.rows[0].id;
-    
-    console.log(`เพิ่มพนักงานใหม่สำเร็จ ID: ${newId}`);
-    res.json({ 
-      success: true, 
-      message: 'เพิ่มพนักงานเรียบร้อยแล้ว',
-      id: newId
+    res.json({
+      success: true,
+      message: `ลบข้อมูลเรียบร้อยแล้ว ${deletedCount} รายการ`,
+      deleted_count: deletedCount
     });
     
   } catch (error) {
-    console.error('Error adding employee:', error);
+    console.error('Error cleaning up time logs:', error);
     res.json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
   }
 });
 
-// เริ่มเซิร์ฟเวอร์
-// Export for Vercel
+// server.js - Mobile Time Tracker Server (ส่วนที่ 8/8)
+// Graceful Shutdown และ Server Start
+
+// ⭐ Global Error Handlers
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error);
+  console.error('Stack trace:', error.stack);
+  console.error('Error name:', error.name);
+  console.error('Error message:', error.message);
+  
+  // ใน production ควรส่ง error ไป monitoring service
+  if (process.env.NODE_ENV === 'production') {
+    // sendErrorToMonitoring(error);
+  }
+  
+  // Graceful shutdown
+  console.log('🛑 Process will exit due to uncaught exception');
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  
+  // Log error details
+  if (reason instanceof Error) {
+    console.error('Stack trace:', reason.stack);
+  }
+  
+  // ใน production ควรส่ง error ไป monitoring service
+  if (process.env.NODE_ENV === 'production') {
+    // sendErrorToMonitoring(reason);
+  }
+  
+  // Don't exit on unhandled rejection, just log it
+  console.log('⚠️ Unhandled rejection logged, continuing...');
+});
+
+// ⭐ Graceful Shutdown Handlers
+process.on('SIGTERM', async () => {
+  console.log('📱 SIGTERM received, shutting down gracefully...');
+  
+  try {
+    console.log('📱 Closing server connections...');
+    
+    // Stop accepting new requests
+    if (server) {
+      server.close(() => {
+        console.log('📱 HTTP server closed');
+      });
+    }
+    
+    // ปิด database connections
+    if (db && db.close) {
+      console.log('📱 Closing database connections...');
+      await db.close();
+      console.log('📱 Database connections closed');
+    }
+    
+    // รอให้ pending requests เสร็จสิ้น
+    console.log('📱 Waiting for pending requests...');
+    setTimeout(() => {
+      console.log('📱 Server shutdown complete');
+      process.exit(0);
+    }, 5000);
+    
+  } catch (error) {
+    console.error('❌ Error during shutdown:', error);
+    process.exit(1);
+  }
+});
+
+process.on('SIGINT', async () => {
+  console.log('📱 SIGINT received, shutting down gracefully...');
+  
+  try {
+    // ปิด database connections
+    if (db && db.close) {
+      console.log('📱 Closing database connections...');
+      await db.close();
+    }
+    
+    console.log('📱 Server shutdown complete');
+    process.exit(0);
+    
+  } catch (error) {
+    console.error('❌ Error during shutdown:', error);
+    process.exit(1);
+  }
+});
+
+// ⭐ Startup Logging
+console.log('🚀 Server configuration:');
+console.log(`   - Environment: ${process.env.NODE_ENV || 'development'}`);
+console.log(`   - Port: ${port}`);
+console.log(`   - Node version: ${process.version}`);
+console.log(`   - Platform: ${process.platform}`);
+console.log(`   - Memory limit: ${Math.round(process.memoryUsage().heapTotal / 1024 / 1024)}MB`);
+console.log(`   - Timezone: ${process.env.TZ || 'system default'}`);
+console.log(`   - Database: ${process.env.DATABASE_URL ? 'External' : 'Local'}`);
+
+// ⭐ Server Instance Variable
+let server;
+
+// ⭐ Export for Vercel/Cloud deployment
 module.exports = app;
 
-// For local development
+// ⭐ Local Development Server Start
 if (process.env.NODE_ENV !== 'production') {
-  const port = process.env.PORT || 3000;
-  app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+  server = app.listen(port, () => {
+    console.log('\n🎉 ========================================');
+    console.log('🚀 Mobile Time Tracker Server is running!');
+    console.log('🎉 ========================================');
+    console.log(`🌐 Main App: http://localhost:${port}`);
+    console.log(`📱 Mobile API: http://localhost:${port}/api/mobile`);
+    console.log(`👨‍💼 Admin Panel: http://localhost:${port}/admin`);
+    console.log(`💊 Health Check: http://localhost:${port}/health`);
+    console.log(`📊 Metrics: http://localhost:${port}/metrics`);
+    console.log(`🔧 Debug: http://localhost:${port}/debug`);
+    console.log('🎉 ========================================\n');
+    
+    // เริ่มต้น background tasks
+    console.log('🔄 Starting background services...');
+    
+    // Test database connection
+    db.healthCheck().then(health => {
+      if (health.healthy) {
+        console.log('✅ Database connection verified');
+      } else {
+        console.error('❌ Database connection failed');
+      }
+    }).catch(err => {
+      console.error('❌ Database health check failed:', err);
+    });
+    
+    // Start cache warming
+    setTimeout(() => {
+      console.log('🔥 Warming up caches...');
+      getEmployeesFromCache().then(employees => {
+        console.log(`✅ Employee cache warmed with ${employees.length} employees`);
+      }).catch(err => {
+        console.warn('⚠️ Cache warming failed:', err.message);
+      });
+    }, 2000);
+    
+    console.log('✅ Server started successfully!');
   });
+  
+  // Handle server errors
+  server.on('error', (error) => {
+    if (error.syscall !== 'listen') {
+      throw error;
+    }
+    
+    const bind = typeof port === 'string' ? 'Pipe ' + port : 'Port ' + port;
+    
+    switch (error.code) {
+      case 'EACCES':
+        console.error(`❌ ${bind} requires elevated privileges`);
+        process.exit(1);
+        break;
+      case 'EADDRINUSE':
+        console.error(`❌ ${bind} is already in use`);
+        process.exit(1);
+        break;
+      default:
+        throw error;
+    }
+  });
+  
+} else {
+  // Production mode - just log that we're ready
+  console.log('🚀 Production server ready for deployment');
+  console.log('✅ All routes and middleware configured');
 }
+
+// ⭐ Additional Production Checks
+if (process.env.NODE_ENV === 'production') {
+  // Verify critical environment variables
+  const requiredEnvVars = ['DATABASE_URL'];
+  const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+  
+  if (missingVars.length > 0) {
+    console.error('❌ Missing required environment variables:', missingVars);
+    console.error('🛑 Server cannot start without these variables');
+    process.exit(1);
+  }
+  
+  // Set production optimizations
+  app.set('trust proxy', 1); // Trust first proxy
+  
+  console.log('✅ Production environment verified');
+  console.log('🔒 Security features enabled');
+  console.log('⚡ Performance optimizations active');
+}
+
+// ⭐ Final cleanup on exit
+process.on('exit', (code) => {
+  console.log(`\n📱 Process exiting with code: ${code}`);
+  console.log('👋 Goodbye! Thanks for using Mobile Time Tracker');
+});
+
+// ⭐ Memory monitoring for development
+if (process.env.NODE_ENV === 'development') {
+  setInterval(() => {
+    const memUsage = process.memoryUsage();
+    const memUsed = Math.round(memUsage.heapUsed / 1024 / 1024);
+    const memTotal = Math.round(memUsage.heapTotal / 1024 / 1024);
+    const memPercent = Math.round((memUsage.heapUsed / memUsage.heapTotal) * 100);
+    
+    if (memPercent > 80) {
+      console.warn(`⚠️ High memory usage: ${memUsed}MB / ${memTotal}MB (${memPercent}%)`);
+    }
+  }, 60000); // Check every minute
+}
+
+console.log('📝 Server script loaded successfully');
+console.log('⏳ Waiting for initialization to complete...');
