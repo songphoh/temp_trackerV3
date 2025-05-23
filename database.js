@@ -25,6 +25,7 @@ const pool = new Pool({
 // Error handling for the pool
 pool.on('error', (err, client) => {
   console.error('Unexpected error on idle client', err);
+  process.exit(-1); // Exit on critical errors
 });
 
 // Connection monitoring
