@@ -2,33 +2,50 @@ const { Pool } = require('pg');
 const path = require('path');
 const fs = require('fs');
 
-// กำหนดค่า connection string สำหรับ PostgreSQL
-// ใช้ environment variables สำหรับการเชื่อมต่อ (สำคัญสำหรับการ deploy)
-//const connectionString = process.env.DATABASE_URL || 'postgres://avnadmin:AVNS_f55VsqPVus0il98ErN3@pg-3c45e39d-nammunla1996-5f87.j.aivencloud.com:27540/defaultdb?sslmode=require';
+// Connection string from environment variable
 const connectionString = process.env.DATABASE_URL || "postgresql://postgres.ofzfxbhzkvrumsgrgogq:%40Songphon544942@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres";
 
-// สร้าง connection pool
+// Optimized pool configuration
 const pool = new Pool({
   connectionString,
   ssl: {
     rejectUnauthorized: false,
     checkServerIdentity: () => undefined
   },
-  connectionTimeoutMillis: 15000,
+  // Increased timeouts and better pool management
+  connectionTimeoutMillis: 30000,
+  idleTimeoutMillis: 60000,
+  max: 20, // Increased for better concurrency
+  min: 4,  // Maintain minimum connections
+  acquireTimeoutMillis: 60000,
+  allowExitOnIdle: false,
   timezone: 'Asia/Bangkok'
 });
 
-// ฟังก์ชันสำหรับเช็คการเชื่อมต่อและเตรียมฐานข้อมูล
+// Error handling for the pool
+pool.on('error', (err, client) => {
+  console.error('Unexpected error on idle client', err);
+});
+
+// Connection monitoring
+pool.on('connect', (client) => {
+  console.log('New client connected to database');
+});
+
+pool.on('remove', (client) => {
+  console.log('Client removed from pool');
+});
+
+// Improved database initialization
 async function initializeDatabase() {
-  console.log('กำลังเตรียมฐานข้อมูล...');
-  
-  const client = await pool.connect();
-  
+  let client;
   try {
-    // เริ่ม transaction
+    console.log('Initializing database...');
+    client = await pool.connect();
+    
     await client.query('BEGIN');
     
-    // สร้างตารางเก็บรายชื่อพนักงาน
+    // Create employees table with better indexing
     await client.query(`
       CREATE TABLE IF NOT EXISTS employees (
         id SERIAL PRIMARY KEY,
@@ -41,11 +58,14 @@ async function initializeDatabase() {
         line_picture TEXT,
         status TEXT DEFAULT 'active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_employees_emp_code ON employees(emp_code);
+      CREATE INDEX IF NOT EXISTS idx_employees_full_name ON employees(full_name);
+      CREATE INDEX IF NOT EXISTS idx_employees_status ON employees(status);
     `);
-    console.log('ตาราง employees สร้างหรือมีอยู่แล้ว');
 
-    // สร้างตารางเก็บบันทึกเวลา
+    // Create time_logs table with optimized indexing
     await client.query(`
       CREATE TABLE IF NOT EXISTS time_logs (
         id SERIAL PRIMARY KEY,
@@ -63,45 +83,69 @@ async function initializeDatabase() {
         status TEXT DEFAULT 'normal',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (employee_id) REFERENCES employees(id)
-      )
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_time_logs_employee_id ON time_logs(employee_id);
+      CREATE INDEX IF NOT EXISTS idx_time_logs_clock_in ON time_logs(clock_in);
+      CREATE INDEX IF NOT EXISTS idx_time_logs_status ON time_logs(status);
     `);
-    console.log('ตาราง time_logs สร้างหรือมีอยู่แล้ว');
 
-    // สร้างตารางเก็บค่า settings
+    // Create settings table
     await client.query(`
       CREATE TABLE IF NOT EXISTS settings (
         id SERIAL PRIMARY KEY,
         setting_name TEXT NOT NULL UNIQUE,
         setting_value TEXT,
         description TEXT
-      )
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_settings_name ON settings(setting_name);
     `);
-    console.log('ตาราง settings สร้างหรือมีอยู่แล้ว');
     
-    // Commit transaction
     await client.query('COMMIT');
     
-    // เพิ่มข้อมูลเริ่มต้น
+    // Initialize settings and sample data
     await addInitialSettings();
     await addSampleEmployees();
     
-    console.log('เตรียมฐานข้อมูลเสร็จสมบูรณ์');
+    console.log('Database initialization completed successfully');
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (client) await client.query('ROLLBACK');
     console.error('Error initializing database:', err.message);
+    throw err;
   } finally {
-    client.release();
+    if (client) client.release();
   }
 }
 
-// เพิ่มข้อมูลการตั้งค่าเริ่มต้น
+// Helper function to retry failed queries
+async function queryWithRetry(queryFn, maxRetries = 3) {
+  let lastError;
+  
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await queryFn();
+    } catch (err) {
+      lastError = err;
+      if (err.code === '40P01') { // Deadlock detected
+        await new Promise(resolve => setTimeout(resolve, 50 * Math.pow(2, i)));
+        continue;
+      }
+      throw err;
+    }
+  }
+  
+  throw lastError;
+}
+
+// Add initial settings with better error handling
 async function addInitialSettings() {
+  const client = await pool.connect();
   try {
-    // ตรวจสอบว่ามีข้อมูลในตาราง settings หรือไม่
-    const countResult = await pool.query('SELECT COUNT(*) as count FROM settings');
+    const countResult = await client.query('SELECT COUNT(*) as count FROM settings');
     
     if (parseInt(countResult.rows[0].count) === 0) {
-      console.log('กำลังเพิ่มการตั้งค่าเริ่มต้น...');
+      console.log('Adding initial settings...');
       
       const settings = [
         { name: 'organization_name', value: 'องค์การบริหารส่วนตำบลหัวนา', desc: 'ชื่อหน่วยงาน' },
@@ -118,54 +162,86 @@ async function addInitialSettings() {
         { name: 'admin_password', value: 'admin123', desc: 'รหัสผ่านสำหรับแอดมิน' }
       ];
       
-      const insertQuery = 'INSERT INTO settings (setting_name, setting_value, description) VALUES ($1, $2, $3)';
+      await client.query('BEGIN');
       
       for (const setting of settings) {
-        await pool.query(insertQuery, [setting.name, setting.value, setting.desc]);
+        await client.query(
+          'INSERT INTO settings (setting_name, setting_value, description) VALUES ($1, $2, $3)',
+          [setting.name, setting.value, setting.desc]
+        );
       }
       
-      console.log('เพิ่มการตั้งค่าเริ่มต้นเรียบร้อยแล้ว');
+      await client.query('COMMIT');
+      console.log('Initial settings added successfully');
     }
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('Error adding initial settings:', err.message);
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
-// เพิ่มข้อมูลพนักงานตัวอย่าง
+// Add sample employees with better error handling
 async function addSampleEmployees() {
+  const client = await pool.connect();
   try {
-    // ตรวจสอบว่ามีข้อมูลในตาราง employees หรือไม่
-    const countResult = await pool.query('SELECT COUNT(*) as count FROM employees');
+    const countResult = await client.query('SELECT COUNT(*) as count FROM employees');
     
     if (parseInt(countResult.rows[0].count) === 0) {
-      console.log('กำลังเพิ่มพนักงานตัวอย่าง...');
+      console.log('Adding sample employees...');
       
       const employees = [
         { code: '001', name: 'สมชาย ใจดี', position: 'ผู้จัดการ', department: 'บริหาร' },
         { code: '002', name: 'สมหญิง รักเรียน', position: 'เจ้าหน้าที่', department: 'ธุรการ' }
       ];
       
-      const insertQuery = 'INSERT INTO employees (emp_code, full_name, position, department) VALUES ($1, $2, $3, $4)';
+      await client.query('BEGIN');
       
       for (const emp of employees) {
-        await pool.query(insertQuery, [emp.code, emp.name, emp.position, emp.department]);
+        await client.query(
+          'INSERT INTO employees (emp_code, full_name, position, department) VALUES ($1, $2, $3, $4)',
+          [emp.code, emp.name, emp.position, emp.department]
+        );
       }
       
-      console.log('เพิ่มพนักงานตัวอย่างเรียบร้อยแล้ว');
+      await client.query('COMMIT');
+      console.log('Sample employees added successfully');
     }
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('Error adding sample employees:', err.message);
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
-// เริ่มต้นเตรียมฐานข้อมูล
-initializeDatabase();
+// Initialize database
+initializeDatabase().catch(console.error);
 
-// สร้าง helper functions สำหรับ query
+// Export optimized query interface
 const db = {
-  query: (text, params) => pool.query(text, params),
+  query: (text, params) => queryWithRetry(() => pool.query(text, params)),
   getClient: () => pool.connect(),
-  pool: pool
+  pool: pool,
+  
+  // Helper for transactions
+  transaction: async (callback) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await callback(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
 };
 
 module.exports = db;
